@@ -1,0 +1,12 @@
+[package]
+name = "third-principles-bot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+azalea = { git = "https://github.com/azalea-rs/azalea", branch = "1.21.11" }
+
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3
