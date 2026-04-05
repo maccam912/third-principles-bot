@@ -5,6 +5,10 @@ edition = "2024"
 
 [dependencies]
 azalea = { git = "https://github.com/azalea-rs/azalea", branch = "1.21.11" }
+dotenvy = "0.15.7"
+eyre = "0.6.12"
+parking_lot = "0.12"
+tokio = "1.51.0"
 
 [profile.dev]
 opt-level = 1

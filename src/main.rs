@@ -1,31 +1,27 @@
-//! A simple bot that repeats chat messages sent by other players.
+//! A Minecraft bot controlled via chat commands.
+//!
+//! Send `!<botname> <command>` in chat to control the bot.
+
+mod commands;
+mod state;
 
 use azalea::prelude::*;
+use state::State;
 
 #[tokio::main]
 async fn main() -> AppExit {
+    dotenvy::dotenv().ok();
+    let server_url = std::env::var("SERVER_URL").expect("SERVER_URL must be set in .env");
+
     let account = Account::offline("GoodBot");
-    // or let account = Account::microsoft("email").await.unwrap();
+    // or: let account = Account::microsoft("email").await.unwrap();
 
     ClientBuilder::new()
         .set_handler(handle)
-        .start(account, "minecraft.rackspace.koski.co")
+        .start(account, server_url.as_str())
         .await
 }
 
-#[derive(Clone, Component, Default)]
-pub struct State {}
-
-async fn handle(bot: Client, event: Event, _state: State) -> eyre::Result<()> {
-    if let Event::Chat(m) = event
-        && let (Some(sender), content) = m.split_sender_and_content()
-    {
-        if sender == bot.username() {
-            // ignore our own messages
-            return Ok(());
-        }
-        bot.chat(content);
-    }
-
-    Ok(())
+async fn handle(bot: Client, event: azalea::Event, state: State) -> eyre::Result<()> {
+    state::handle(bot, event, state).await
 }
