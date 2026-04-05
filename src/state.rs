@@ -624,20 +624,27 @@ fn nearest_collect_drop(
     )
 }
 
-fn collect_tick(bot: Client, state: State, mut job: CollectJob) {
-    let current_count = current_inventory_count(&bot, &job.target);
+pub enum CollectTickOutcome {
+    Continue(CollectJob),
+    Done { collected: u32, name: String },
+    ExhaustedTargets { collected: u32, requested: u32, name: String },
+}
+
+fn collect_tick_inner(bot: &Client, mut job: CollectJob) -> CollectTickOutcome {
+    let current_count = current_inventory_count(bot, &job.target);
     let collected = current_count.saturating_sub(job.baseline_count);
 
     if collected >= job.requested_count {
         bot.stop_pathfinding();
-        *state.mode.lock() = BotMode::Idle;
-        bot.chat(format!("Collected {} {}.", collected, job.target.name).as_str());
-        return;
+        return CollectTickOutcome::Done {
+            collected,
+            name: job.target.name.clone(),
+        };
     }
 
     match job.phase {
         CollectPhase::Searching => {
-            let candidates = find_collect_candidates(&bot, &job.target);
+            let candidates = find_collect_candidates(bot, &job.target);
             let next = choose_next_collect_block(
                 &candidates,
                 BlockPos::from(bot.position()),
@@ -647,22 +654,18 @@ fn collect_tick(bot: Client, state: State, mut job: CollectJob) {
 
             let Some(next) = next else {
                 bot.stop_pathfinding();
-                *state.mode.lock() = BotMode::Idle;
-                bot.chat(
-                    format!(
-                        "I only collected {}/{} {} before running out of targets.",
-                        collected, job.requested_count, job.target.name
-                    )
-                    .as_str(),
-                );
-                return;
+                return CollectTickOutcome::ExhaustedTargets {
+                    collected,
+                    requested: job.requested_count,
+                    name: job.target.name.clone(),
+                };
             };
 
             job.active_block_target = Some(next);
             job.phase = CollectPhase::MovingToBlock(next);
         }
         CollectPhase::MovingToBlock(target_pos) => {
-            if !block_is_collect_target(&bot, &job.target, target_pos) {
+            if !block_is_collect_target(bot, &job.target, target_pos) {
                 job.active_block_target = None;
                 job.phase = CollectPhase::Searching;
             } else if bot.position().distance_to(target_pos.center()) <= 4.5 {
@@ -676,14 +679,13 @@ fn collect_tick(bot: Client, state: State, mut job: CollectJob) {
             }
         }
         CollectPhase::Mining(target_pos) => {
-            if !block_is_collect_target(&bot, &job.target, target_pos) {
+            if !block_is_collect_target(bot, &job.target, target_pos) {
                 job.last_mined_block = Some(target_pos);
                 job.active_block_target = None;
                 job.phase = CollectPhase::Looting;
             } else {
-                if equip_collect_tool(&bot, &job.target) {
-                    *state.mode.lock() = BotMode::Collecting(job);
-                    return;
+                if equip_collect_tool(bot, &job.target) {
+                    return CollectTickOutcome::Continue(job);
                 }
                 bot.look_at(target_pos.center());
                 if !bot.is_mining() {
@@ -692,7 +694,7 @@ fn collect_tick(bot: Client, state: State, mut job: CollectJob) {
             }
         }
         CollectPhase::Looting => {
-            if let Some(drop) = nearest_collect_drop(&bot, &job.target, job.last_mined_block) {
+            if let Some(drop) = nearest_collect_drop(bot, &job.target, job.last_mined_block) {
                 let drop_pos = drop.position();
                 if bot.position().distance_to(drop_pos) <= 1.5 {
                     bot.stop_pathfinding();
@@ -709,7 +711,26 @@ fn collect_tick(bot: Client, state: State, mut job: CollectJob) {
         }
     }
 
-    *state.mode.lock() = BotMode::Collecting(job);
+    CollectTickOutcome::Continue(job)
+}
+
+fn collect_tick(bot: Client, state: State, job: CollectJob) {
+    match collect_tick_inner(&bot, job) {
+        CollectTickOutcome::Continue(job) => {
+            *state.mode.lock() = BotMode::Collecting(job);
+        }
+        CollectTickOutcome::Done { collected, name } => {
+            *state.mode.lock() = BotMode::Idle;
+            bot.chat(&format!("Collected {} {}.", collected, name));
+        }
+        CollectTickOutcome::ExhaustedTargets { collected, requested, name } => {
+            *state.mode.lock() = BotMode::Idle;
+            bot.chat(&format!(
+                "I only collected {}/{} {} before running out of targets.",
+                collected, requested, name
+            ));
+        }
+    }
 }
 
 /// Per-bot state stored as a Bevy ECS component.
