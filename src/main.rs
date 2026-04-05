@@ -3,6 +3,7 @@
 //! Send `!<botname> <command>` in chat to control the bot.
 
 mod commands;
+mod llm;
 mod state;
 
 use azalea::prelude::*;
