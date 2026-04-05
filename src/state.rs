@@ -1,6 +1,6 @@
 //! Per-bot state and the main event handler.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::{sync::Arc, time::Duration};
 
 use azalea::{
@@ -41,6 +41,7 @@ pub enum BotMode {
     Following(Entity),
     /// Collecting resources until the requested inventory delta is reached.
     Collecting(CollectJob),
+    Building(BuildJob),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,6 +179,64 @@ impl CollectJob {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Build state types
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct BuildJob {
+    pub description: String,
+    pub origin: BlockPos,
+    pub phase: BuildPhase,
+}
+
+#[derive(Clone, Debug)]
+pub enum BuildPhase {
+    ScanningChests {
+        chests: Vec<BlockPos>,
+        result: Arc<Mutex<Option<HashMap<String, u32>>>>,
+        spawned: bool,
+    },
+    WaitingForLlm {
+        inventory: HashMap<String, u32>,
+        result: Arc<Mutex<Option<Result<crate::llm::Structure, String>>>>,
+        spawned: bool,
+    },
+    CollectingResources {
+        structure: crate::llm::Structure,
+        missing: VecDeque<(String, u32)>,
+        active_job: Option<CollectJob>,
+    },
+    PlacingBlocks {
+        structure: crate::llm::Structure,
+        next_index: usize,
+        placement_attempts: u8,
+        waiting_for_confirmation: bool,
+    },
+}
+
+pub fn strip_namespace(id: &str) -> &str {
+    id.strip_prefix("minecraft:").unwrap_or(id)
+}
+
+pub fn compute_missing(
+    structure: &crate::llm::Structure,
+    inventory: &HashMap<String, u32>,
+) -> VecDeque<(String, u32)> {
+    let mut missing = VecDeque::new();
+    for (item, &needed) in &structure.materials {
+        let have = inventory.get(item).copied().unwrap_or(0);
+        if needed > have {
+            missing.push_back((item.clone(), needed - have));
+        }
+    }
+    missing
+}
+
+pub fn sort_blocks_by_y(blocks: &mut Vec<crate::llm::BlockEntry>) {
+    blocks.sort_by_key(|b| b.y);
+}
+
 #[cfg(test)]
 pub fn next_collect_phase_after_search(target: Option<BlockPos>) -> CollectPhase {
     match target {
@@ -226,7 +285,7 @@ fn collect_pathfinder_opts() -> PathfinderOpts {
         .max_timeout(PathfinderTimeout::Time(Duration::from_secs(1)))
 }
 
-fn block_distance_sq(a: BlockPos, b: BlockPos) -> i64 {
+pub fn block_distance_sq(a: BlockPos, b: BlockPos) -> i64 {
     let dx = i64::from(a.x - b.x);
     let dy = i64::from(a.y - b.y);
     let dz = i64::from(a.z - b.z);
@@ -760,6 +819,7 @@ fn tick(bot: Client, state: State) {
             }
         }
         BotMode::Collecting(job) => collect_tick(bot, state, job),
+        BotMode::Building(_) => {}
     }
 }
 
@@ -772,9 +832,9 @@ mod tests {
     use super::{
         CollectJob, CollectPhase, CollectProgress, CollectTarget, PreferredTool, ToolEquipPlan,
         ToolSearchOutcome, choose_next_collect_block, collect_progress_from_counts,
-        log_collect_tool_search_attempt, log_collect_tool_search_outcome,
+        compute_missing, log_collect_tool_search_attempt, log_collect_tool_search_outcome,
         next_collect_phase_after_search, normalize_collect_candidates, plan_tool_equip,
-        preferred_tool_for_collect_target,
+        preferred_tool_for_collect_target, sort_blocks_by_y, strip_namespace,
     };
 
     fn slot_items(items: &[Option<ItemKind>]) -> Vec<Option<ItemKind>> {
@@ -1018,5 +1078,57 @@ mod tests {
             ),
             "[collect] no pickaxe found for coal_ore, mining without one"
         );
+    }
+
+    #[test]
+    fn strip_namespace_removes_minecraft_prefix() {
+        assert_eq!(strip_namespace("minecraft:dirt"), "dirt");
+        assert_eq!(strip_namespace("dirt"), "dirt");
+        assert_eq!(strip_namespace("minecraft:oak_planks"), "oak_planks");
+    }
+
+    #[test]
+    fn compute_missing_returns_deficit() {
+        use crate::llm::Structure;
+        let mut materials = std::collections::HashMap::new();
+        materials.insert("minecraft:dirt".to_owned(), 10u32);
+        materials.insert("minecraft:cobblestone".to_owned(), 5u32);
+        let structure = Structure { blocks: vec![], materials };
+
+        let mut inventory = std::collections::HashMap::new();
+        inventory.insert("minecraft:dirt".to_owned(), 3u32);
+
+        let missing = compute_missing(&structure, &inventory);
+        let missing_vec: Vec<_> = missing.into_iter().collect();
+        assert!(missing_vec.contains(&("minecraft:dirt".to_owned(), 7)));
+        assert!(missing_vec.contains(&("minecraft:cobblestone".to_owned(), 5)));
+    }
+
+    #[test]
+    fn compute_missing_returns_empty_when_fully_stocked() {
+        use crate::llm::Structure;
+        let mut materials = std::collections::HashMap::new();
+        materials.insert("minecraft:dirt".to_owned(), 10u32);
+        let structure = Structure { blocks: vec![], materials };
+
+        let mut inventory = std::collections::HashMap::new();
+        inventory.insert("minecraft:dirt".to_owned(), 15u32);
+
+        let missing = compute_missing(&structure, &inventory);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn sort_blocks_by_y_orders_ascending() {
+        use crate::llm::BlockEntry;
+        let mut blocks = vec![
+            BlockEntry { x: 0, y: 3, z: 0, block: "minecraft:dirt".to_owned() },
+            BlockEntry { x: 0, y: 1, z: 0, block: "minecraft:dirt".to_owned() },
+            BlockEntry { x: 0, y: 2, z: 0, block: "minecraft:dirt".to_owned() },
+        ];
+        sort_blocks_by_y(&mut blocks);
+        assert_eq!(blocks[0].y, 1);
+        assert_eq!(blocks[1].y, 2);
+        assert_eq!(blocks[2].y, 3);
     }
 }
