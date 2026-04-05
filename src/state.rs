@@ -1,6 +1,7 @@
 //! Per-bot state and the main event handler.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::str::FromStr;
 use std::{sync::Arc, time::Duration};
 
 use azalea::{
@@ -567,6 +568,77 @@ fn equip_collect_tool(bot: &Client, target: &CollectTarget) -> bool {
     }
 }
 
+fn plan_item_equip(
+    slots: &[Option<ItemKind>],
+    hotbar_slots: std::ops::RangeInclusive<usize>,
+    selected_hotbar_index: u8,
+    target: ItemKind,
+) -> Option<ToolEquipPlan> {
+    let hotbar_start = *hotbar_slots.start();
+    let selected_hotbar_slot = hotbar_start + usize::from(selected_hotbar_index);
+
+    if slots.get(selected_hotbar_slot).copied().flatten() == Some(target) {
+        return None;
+    }
+
+    for slot in hotbar_slots.clone() {
+        if slots.get(slot).copied().flatten() == Some(target) {
+            return Some(ToolEquipPlan::SelectHotbar {
+                hotbar_index: (slot - hotbar_start) as u8,
+            });
+        }
+    }
+
+    for (slot, item) in slots.iter().copied().enumerate() {
+        if hotbar_slots.contains(&slot) {
+            continue;
+        }
+        if item == Some(target) {
+            return Some(ToolEquipPlan::MoveToSelectedHotbar {
+                source_slot: slot,
+                hotbar_slot: selected_hotbar_slot,
+                hotbar_index: selected_hotbar_index,
+            });
+        }
+    }
+
+    None
+}
+
+/// Equip `target` item to active hotbar slot. Returns `true` if a swap was initiated
+/// (caller should return early to let the swap take effect next tick).
+fn equip_item(bot: &Client, target: ItemKind) -> bool {
+    let menu = bot.menu();
+    let slots: Vec<Option<ItemKind>> = menu
+        .slots()
+        .into_iter()
+        .map(|s| s.is_present().then(|| s.kind()))
+        .collect();
+    let hotbar_slots = menu.hotbar_slots_range();
+    let selected = bot.selected_hotbar_slot();
+
+    match plan_item_equip(&slots, hotbar_slots.clone(), selected, target) {
+        None => false,
+        Some(ToolEquipPlan::SelectHotbar { hotbar_index }) => {
+            bot.set_selected_hotbar_slot(hotbar_index);
+            false
+        }
+        Some(ToolEquipPlan::MoveToSelectedHotbar {
+            source_slot,
+            hotbar_slot,
+            hotbar_index,
+        }) => {
+            if let Some(inventory) = bot.open_inventory() {
+                inventory.left_click(source_slot);
+                inventory.left_click(hotbar_slot);
+                inventory.left_click(source_slot);
+                bot.set_selected_hotbar_slot(hotbar_index);
+            }
+            true
+        }
+    }
+}
+
 fn normalize_collect_candidates(
     candidates: &[BlockPos],
     collapse_vertical_columns: bool,
@@ -733,6 +805,246 @@ fn collect_tick(bot: Client, state: State, job: CollectJob) {
     }
 }
 
+fn build_tick(bot: Client, state: State, mut job: BuildJob) {
+    match &mut job.phase {
+        BuildPhase::ScanningChests { chests, result, spawned } => {
+            if !*spawned {
+                let result = Arc::clone(result);
+                let bot_clone = bot.clone();
+                let chests = chests.clone();
+                tokio::task::spawn(async move {
+                    let inventory: HashMap<String, u32> = HashMap::new();
+                    for chest_pos in chests {
+                        let goal = RadiusGoal::new(chest_pos.center(), 3.0);
+                        bot_clone.goto(goal).await;
+                        // TODO: open chest and read contents via azalea container API
+                        // When azalea exposes an async open_container method, use it here.
+                        // For now, chest contents are not scanned.
+                        eprintln!("[build] at chest {chest_pos:?}, container API not available yet");
+                    }
+                    *result.lock() = Some(inventory);
+                });
+                *spawned = true;
+            }
+
+            let scan_done = result.lock().is_some();
+            if scan_done {
+                let chest_inventory = result.lock().take().unwrap();
+                // Merge bot's own inventory
+                let mut combined = chest_inventory;
+                for slot in bot.menu().contents() {
+                    if !slot.is_present() {
+                        continue;
+                    }
+                    let raw = slot.kind().to_string();
+                    let id = if raw.contains(':') { raw } else { format!("minecraft:{raw}") };
+                    *combined.entry(id).or_insert(0) += slot.count().max(0) as u32;
+                }
+                job.phase = BuildPhase::WaitingForLlm {
+                    inventory: combined,
+                    result: Arc::new(Mutex::new(None)),
+                    spawned: false,
+                };
+            }
+        }
+        BuildPhase::WaitingForLlm { inventory, result, spawned } => {
+            if !*spawned {
+                let result = Arc::clone(result);
+                let description = job.description.clone();
+                let inventory = inventory.clone();
+                tokio::task::spawn(async move {
+                    let outcome = crate::llm::call_llm(&description, &inventory).await;
+                    *result.lock() = Some(outcome);
+                });
+                *spawned = true;
+            }
+
+            let llm_result = result.lock().clone();
+            if let Some(outcome) = llm_result {
+                match outcome {
+                    Ok(mut structure) => {
+                        let missing = compute_missing(&structure, &*inventory);
+                        if missing.is_empty() {
+                            sort_blocks_by_y(&mut structure.blocks);
+                            job.phase = BuildPhase::PlacingBlocks {
+                                structure,
+                                next_index: 0,
+                                placement_attempts: 0,
+                                waiting_for_confirmation: false,
+                            };
+                        } else {
+                            job.phase = BuildPhase::CollectingResources {
+                                structure,
+                                missing,
+                                active_job: None,
+                            };
+                        }
+                    }
+                    Err(e) => {
+                        bot.stop_pathfinding();
+                        *state.mode.lock() = BotMode::Idle;
+                        bot.chat(&format!("Build failed: LLM error — {e}."));
+                        return;
+                    }
+                }
+            }
+        }
+        BuildPhase::CollectingResources { structure, missing, active_job } => {
+            // Pop from queue only when there's no active job
+            if active_job.is_none() {
+                if let Some((item_id, count)) = missing.pop_front() {
+                    let name = strip_namespace(&item_id).to_owned();
+                    let block_kind = BlockKind::from_str(&name).ok();
+                    let item_kind = ItemKind::from_str(&name).ok();
+                    match (block_kind, item_kind) {
+                        (Some(bk), Some(ik)) => {
+                            let target = CollectTarget::exact(name, bk, ik);
+                            let baseline = bot
+                                .menu()
+                                .contents()
+                                .into_iter()
+                                .filter(|s| s.kind() == ik)
+                                .map(|s| s.count().max(0) as u32)
+                                .sum();
+                            let mut cjob = CollectJob::new(target, count);
+                            cjob.baseline_count = baseline;
+                            *active_job = Some(cjob);
+                        }
+                        _ => {
+                            eprintln!("[build] can't collect unknown item {item_id}, skipping");
+                        }
+                    }
+                }
+            }
+
+            // Run one tick on the active job
+            if let Some(cjob) = active_job.take() {
+                match collect_tick_inner(&bot, cjob) {
+                    CollectTickOutcome::Continue(updated) => {
+                        *active_job = Some(updated);
+                    }
+                    CollectTickOutcome::Done { .. }
+                    | CollectTickOutcome::ExhaustedTargets { .. } => {
+                        // active_job remains None; next tick will pop the next item
+                    }
+                }
+            }
+
+            // Transition when queue is exhausted and no active job
+            if missing.is_empty() && active_job.is_none() {
+                let mut sorted_structure = structure.clone();
+                sort_blocks_by_y(&mut sorted_structure.blocks);
+                job.phase = BuildPhase::PlacingBlocks {
+                    structure: sorted_structure,
+                    next_index: 0,
+                    placement_attempts: 0,
+                    waiting_for_confirmation: false,
+                };
+            }
+        }
+        BuildPhase::PlacingBlocks {
+            structure,
+            next_index,
+            placement_attempts,
+            waiting_for_confirmation,
+        } => {
+            if *next_index >= structure.blocks.len() {
+                bot.stop_pathfinding();
+                *state.mode.lock() = BotMode::Idle;
+                bot.chat(&format!("Finished building {}.", job.description));
+                return;
+            }
+
+            let block_entry = &structure.blocks[*next_index];
+            let target = BlockPos {
+                x: job.origin.x + block_entry.x,
+                y: job.origin.y + block_entry.y,
+                z: job.origin.z + block_entry.z,
+            };
+
+            if *waiting_for_confirmation {
+                let world = bot.world();
+                let current_kind = world
+                    .read()
+                    .get_block_state(target)
+                    .map(BlockKind::from);
+
+                let expected_kind = BlockKind::from_str(strip_namespace(&block_entry.block)).ok();
+
+                match (current_kind, expected_kind) {
+                    (Some(actual), Some(expected)) if actual == expected => {
+                        *waiting_for_confirmation = false;
+                        *placement_attempts = 0;
+                        *next_index += 1;
+                    }
+                    (Some(actual), _) if actual != BlockKind::Air => {
+                        *placement_attempts += 1;
+                        if *placement_attempts >= 3 {
+                            bot.stop_pathfinding();
+                            *state.mode.lock() = BotMode::Idle;
+                            bot.chat(&format!(
+                                "Build failed: couldn't place {} at {},{},{} after 3 attempts. Aborting.",
+                                block_entry.block, target.x, target.y, target.z
+                            ));
+                            return;
+                        }
+                        bot.look_at(target.center());
+                        if !bot.is_mining() {
+                            bot.start_mining(target);
+                        }
+                        *waiting_for_confirmation = false;
+                    }
+                    _ => {
+                        *placement_attempts += 1;
+                        if *placement_attempts >= 3 {
+                            bot.stop_pathfinding();
+                            *state.mode.lock() = BotMode::Idle;
+                            bot.chat(&format!(
+                                "Build failed: couldn't place {} at {},{},{} after 3 attempts. Aborting.",
+                                block_entry.block, target.x, target.y, target.z
+                            ));
+                            return;
+                        }
+                        *waiting_for_confirmation = false;
+                    }
+                }
+            } else {
+                let item_name = strip_namespace(&block_entry.block);
+                if let Ok(item_kind) = ItemKind::from_str(item_name) {
+                    if equip_item(&bot, item_kind) {
+                        *state.mode.lock() = BotMode::Building(job);
+                        return;
+                    }
+                }
+
+                if bot.position().distance_to(target.center()) > 4.5 {
+                    if !bot.is_calculating_path() {
+                        bot.start_goto_with_opts(
+                            RadiusGoal::new(target.center(), 3.0),
+                            collect_pathfinder_opts(),
+                        );
+                    }
+                    *state.mode.lock() = BotMode::Building(job);
+                    return;
+                }
+
+                bot.look_at(target.center());
+                // Place the block by right-clicking the top face of the block below.
+                // This is the standard Minecraft way to place a block on a surface.
+                // TODO: verify if azalea exposes a higher-level place_block API.
+                let below = BlockPos {
+                    x: target.x,
+                    y: target.y - 1,
+                    z: target.z,
+                };
+                bot.block_interact(below);
+                *waiting_for_confirmation = true;
+            }
+        }
+    }
+    *state.mode.lock() = BotMode::Building(job);
+}
+
 /// Per-bot state stored as a Bevy ECS component.
 ///
 /// Wrapping `mode` in `Arc<Mutex<_>>` lets command handlers (which receive a
@@ -840,7 +1152,7 @@ fn tick(bot: Client, state: State) {
             }
         }
         BotMode::Collecting(job) => collect_tick(bot, state, job),
-        BotMode::Building(_) => {}
+        BotMode::Building(job) => build_tick(bot, state, job),
     }
 }
 
