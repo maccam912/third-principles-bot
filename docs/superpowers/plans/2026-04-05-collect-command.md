@@ -4,9 +4,9 @@
 
 **Goal:** Add a `collect` command that gathers supported resources from loaded chunks until the bot's inventory gains the requested amount.
 
-**Architecture:** Keep collection inside the existing tick-driven state machine by extending `BotMode` with a `Collecting` job and phased execution (`Searching`, `MovingToBlock`, `Mining`, `Looting`). Parse and validate the command in a dedicated command module, resolve user-facing targets into source blocks and counted inventory items, and compute progress by comparing current inventory totals against a baseline captured when the job starts.
+**Architecture:** Keep collection inside the existing tick-driven state machine by extending `BotMode` with a `Collecting` job and phased execution (`Searching`, `MovingToBlock`, `Mining`, `Looting`). Parse and validate the command in a dedicated command module, resolve user-facing targets into source blocks and counted inventory items, and compute progress by comparing current inventory totals against a baseline captured when the job starts. Because the current codebase does not yet have collection-specific abstractions, introduce small pure helper seams for target resolution, inventory counting, search selection, and phase transitions before wiring them to Azalea ECS queries.
 
-**Tech Stack:** Rust 2024, `azalea`, Brigadier command parsing, Azalea pathfinder/mining APIs, standard Cargo test/fmt/clippy workflow
+**Tech Stack:** Rust 2024, `azalea` on the pinned git branch in `Cargo.toml`, Brigadier command parsing, Azalea pathfinder/mining/world APIs, standard Cargo test/fmt/clippy workflow
 
 ---
 
@@ -29,8 +29,8 @@ Add unit tests in `src/commands/collect.rs` for:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test collect`
-Expected: FAIL because `src/commands/collect.rs` and helpers do not exist yet.
+Run: `cargo test --lib collect_target_ -- --exact`
+Expected: FAIL because the new tests compile and fail against stub or unimplemented helpers, not because files are missing.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -85,6 +85,7 @@ Extend `src/state.rs` with public collect job types that the command can instant
 - `CollectTarget`
 - `CollectPhase`
 - `CollectJob`
+- an optional active block target stored on `CollectJob`
 
 Update the command handler to:
 - validate count > 0
@@ -106,7 +107,48 @@ git commit -m "feat: connect collect command to state"
 
 ## Chunk 2: Inventory Counting And Search Phase
 
-### Task 3: Add inventory counting helpers
+### Task 3: Add collection seams for pure testing
+
+**Files:**
+- Modify: `src/state.rs`
+- Test: `src/state.rs`
+
+- [ ] **Step 1: Write the failing tests**
+
+Add tests for pure helper types/functions that will let the rest of the collect state machine be tested without a live Azalea client:
+- `collect_job_tracks_active_block_target`
+- `phase_transition_helpers_are_pure`
+- `collect_progress_uses_baseline_and_current_counts`
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `cargo test collect_job_`
+Run: `cargo test phase_transition_`
+Expected: FAIL because the seam types/helpers do not exist yet.
+
+- [ ] **Step 3: Write minimal implementation**
+
+Refactor `src/state.rs` to add small pure helpers for:
+- progress calculation
+- phase transitions
+- active block target updates
+
+These helpers should be usable from unit tests without instantiating live Azalea ECS state.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test collect_job_`
+Run: `cargo test phase_transition_`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/state.rs
+git commit -m "refactor: add collect state seams"
+```
+
+### Task 4: Add inventory counting helpers
 
 **Files:**
 - Modify: `src/state.rs`
@@ -147,7 +189,7 @@ git add src/state.rs
 git commit -m "feat: add collect inventory counting"
 ```
 
-### Task 4: Implement searching and failure on missing targets
+### Task 5: Implement searching and failure on missing targets
 
 **Files:**
 - Modify: `src/state.rs`
@@ -191,7 +233,7 @@ git commit -m "feat: add collect search phase"
 
 ## Chunk 3: Movement, Mining, And Looting
 
-### Task 5: Implement movement and mining phases
+### Task 6: Verify pinned Azalea APIs and implement movement/mining phases
 
 **Files:**
 - Modify: `src/state.rs`
@@ -204,12 +246,24 @@ Add state-transition tests for helpers that do not require a real server:
 - `mining_phase_resets_when_block_disappears`
 - `successful_progress_short_circuits_before_new_search`
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2: Verify pinned Azalea API surface**
 
-Run: `cargo test moving_to_block_ cargo test mining_phase_ cargo test successful_progress_`
+Check the pinned dependency checkout for:
+- mining entry points (`start_mining`, `mine`, `is_mining`)
+- loaded-world block search APIs
+- item entity query types needed for later looting
+
+Run: `rg -n "start_mining|mine\\(|is_mining|find_blocks|ItemEntity|ItemStack" $HOME/.cargo/git/checkouts/azalea-* -g '*.rs'`
+Expected: confirm the exact API names available on the pinned branch before wiring production code.
+
+- [ ] **Step 3: Run tests to verify they fail**
+
+Run: `cargo test moving_to_block_`
+Run: `cargo test mining_phase_`
+Run: `cargo test successful_progress_`
 Expected: FAIL because the collect phase machine is not implemented.
 
-- [ ] **Step 3: Write minimal implementation**
+- [ ] **Step 4: Write minimal implementation**
 
 Extend the tick loop in `src/state.rs` to:
 - path toward the active block using Azalea pathfinder APIs
@@ -221,19 +275,21 @@ Extend the tick loop in `src/state.rs` to:
 
 Keep follow behavior unchanged for `BotMode::Following`.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test moving_to_block_ cargo test mining_phase_ cargo test successful_progress_`
+Run: `cargo test moving_to_block_`
+Run: `cargo test mining_phase_`
+Run: `cargo test successful_progress_`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/state.rs
 git commit -m "feat: add collect movement and mining phases"
 ```
 
-### Task 6: Implement item-drop looting
+### Task 7: Implement item-drop looting
 
 **Files:**
 - Modify: `src/state.rs`
@@ -247,7 +303,8 @@ Add helper tests for:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test loot_ cargo test looting_`
+Run: `cargo test loot_`
+Run: `cargo test looting_`
 Expected: FAIL because looting helpers do not exist.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -260,7 +317,8 @@ Add looting behavior in `src/state.rs`:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test loot_ cargo test looting_`
+Run: `cargo test loot_`
+Run: `cargo test looting_`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -272,7 +330,7 @@ git commit -m "feat: add collect looting phase"
 
 ## Chunk 4: Integration Verification And Cleanup
 
-### Task 7: Verify command integration and failure messaging
+### Task 8: Verify command integration and failure messaging
 
 **Files:**
 - Modify: `src/commands/collect.rs`
@@ -289,7 +347,8 @@ Add tests for:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test collect_reports_ cargo test collect_stop_command_`
+Run: `cargo test collect_reports_`
+Run: `cargo test collect_stop_command_`
 Expected: FAIL because final messaging and stop integration are incomplete.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -301,7 +360,8 @@ Finish integration details:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test collect_reports_ cargo test collect_stop_command_`
+Run: `cargo test collect_reports_`
+Run: `cargo test collect_stop_command_`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -311,7 +371,7 @@ git add src/commands/collect.rs src/state.rs
 git commit -m "feat: finalize collect command flow"
 ```
 
-### Task 8: Full repository verification
+### Task 9: Full repository verification
 
 **Files:**
 - Modify: `src/commands/collect.rs`
@@ -325,7 +385,10 @@ Expected: no output, files formatted in place.
 
 - [ ] **Step 2: Run focused tests**
 
-Run: `cargo test collect cargo test inventory_gain_ cargo test search_ cargo test loot_`
+Run: `cargo test collect`
+Run: `cargo test inventory_gain_`
+Run: `cargo test search_`
+Run: `cargo test loot_`
 Expected: PASS.
 
 - [ ] **Step 3: Run full test suite**
