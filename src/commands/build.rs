@@ -1,4 +1,4 @@
-//! `!<botname> build <description>` — LLM-driven voxel structure builder.
+//! `!<botname> build <description...>` — LLM-driven voxel structure builder.
 
 use std::sync::Arc;
 
