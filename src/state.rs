@@ -628,12 +628,13 @@ fn equip_item(bot: &Client, target: ItemKind) -> bool {
             hotbar_slot,
             hotbar_index,
         }) => {
-            if let Some(inventory) = bot.open_inventory() {
-                inventory.left_click(source_slot);
-                inventory.left_click(hotbar_slot);
-                inventory.left_click(source_slot);
-                bot.set_selected_hotbar_slot(hotbar_index);
-            }
+            let Some(inventory) = bot.open_inventory() else {
+                return false;
+            };
+            inventory.left_click(source_slot);
+            inventory.left_click(hotbar_slot);
+            inventory.left_click(source_slot);
+            bot.set_selected_hotbar_slot(hotbar_index);
             true
         }
     }
@@ -813,7 +814,7 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                 let bot_clone = bot.clone();
                 let chests = chests.clone();
                 tokio::task::spawn(async move {
-                    let inventory: HashMap<String, u32> = HashMap::new();
+                    let mut inventory: HashMap<String, u32> = HashMap::new();
                     for chest_pos in chests {
                         let goal = RadiusGoal::new(chest_pos.center(), 3.0);
                         bot_clone.goto(goal).await;
@@ -978,7 +979,6 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                         *next_index += 1;
                     }
                     (Some(actual), _) if actual != BlockKind::Air => {
-                        *placement_attempts += 1;
                         if *placement_attempts >= 3 {
                             bot.stop_pathfinding();
                             *state.mode.lock() = BotMode::Idle;
@@ -995,7 +995,6 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                         *waiting_for_confirmation = false;
                     }
                     _ => {
-                        *placement_attempts += 1;
                         if *placement_attempts >= 3 {
                             bot.stop_pathfinding();
                             *state.mode.lock() = BotMode::Idle;
@@ -1038,6 +1037,7 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                     z: target.z,
                 };
                 bot.block_interact(below);
+                *placement_attempts += 1;
                 *waiting_for_confirmation = true;
             }
         }
