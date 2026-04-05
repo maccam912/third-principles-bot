@@ -14,7 +14,7 @@ use crate::state::{BotMode, BuildJob, BuildPhase, block_distance_sq};
 pub fn register(commands: &mut Dispatcher) {
     commands.register(
         literal("build").then(
-            argument("description", word()).executes(|ctx: &Ctx| execute_build(ctx)),
+            argument("description", greedy_string()).executes(|ctx: &Ctx| execute_build(ctx)),
         ),
     );
 }
