@@ -1,5 +1,6 @@
 //! Command dispatcher and shared types for all commands.
 
+mod build;
 mod collect;
 mod come;
 mod stop;
@@ -40,6 +41,7 @@ pub type Dispatcher = CommandDispatcher<Mutex<CommandSource>>;
 /// Build a new dispatcher with all commands registered.
 pub fn build() -> Dispatcher {
     let mut d = Dispatcher::new();
+    build::register(&mut d);
     come::register(&mut d);
     collect::register(&mut d);
     stop::register(&mut d);
