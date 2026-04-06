@@ -331,7 +331,7 @@ pub async fn call_llm(
     let client = reqwest::Client::new();
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
-    let content = call_api_once(&client, &url, &api_key, &model, base_messages.clone()).await?;
+    let content = call_api_once(&client, &url, &api_key, &model, base_messages).await?;
 
     match parse_llm_response(&content) {
         Ok(structure) => {
@@ -348,8 +348,16 @@ pub async fn call_llm(
                 parse_err
             );
             let repair_messages = vec![
-                base_messages[0].clone(),
-                base_messages[1].clone(),
+                ChatMessage {
+                    role: "system",
+                    content: SYSTEM_PROMPT.to_owned(),
+                },
+                ChatMessage {
+                    role: "user",
+                    content: format!(
+                        "Description: {description}\nAvailable inventory:\n{inventory_str}"
+                    ),
+                },
                 ChatMessage {
                     role: "assistant",
                     content: content.clone(),
@@ -365,7 +373,10 @@ pub async fn call_llm(
             let content2 =
                 call_api_once(&client, &url, &api_key, &model, repair_messages).await?;
             let structure = parse_llm_response(&content2).map_err(|e2| {
-                format!("failed to parse structure after retry: {e2}\nContent: {content2}")
+                format!(
+                    "failed to parse structure after retry: {e2}\nContent: {}",
+                    content_preview(&content2, 200)
+                )
             })?;
             eprintln!(
                 "[llm] retry succeeded blocks={} materials={}",
@@ -439,9 +450,15 @@ mod tests {
         assert_eq!(structure.blocks.len(), 6);
         assert!(structure.blocks.iter().all(|b| b.block == "minecraft:dirt"));
         assert_eq!(structure.materials["minecraft:dirt"], 6);
-        // Check one specific position
-        assert!(structure.blocks.iter().any(|b| b.x == -1 && b.y == 0 && b.z == -1));
-        assert!(structure.blocks.iter().any(|b| b.x == 1 && b.y == 0 && b.z == 0));
+        // Verify all 6 positions: x in [-1,0,1] × z in [-1,0] at y=0
+        for x in [-1i32, 0, 1] {
+            for z in [-1i32, 0] {
+                assert!(
+                    structure.blocks.iter().any(|b| b.x == x && b.y == 0 && b.z == z),
+                    "missing block at ({x},0,{z})"
+                );
+            }
+        }
     }
 
     #[test]
@@ -450,8 +467,14 @@ mod tests {
         let structure = parse_llm_response(json).unwrap();
         assert_eq!(structure.blocks.len(), 4);
         // offset defaults to [0,0,0]: positions (0,0,0),(1,0,0),(0,0,1),(1,0,1)
-        assert!(structure.blocks.iter().any(|b| b.x == 0 && b.y == 0 && b.z == 0));
-        assert!(structure.blocks.iter().any(|b| b.x == 1 && b.y == 0 && b.z == 1));
+        for x in [0i32, 1] {
+            for z in [0i32, 1] {
+                assert!(
+                    structure.blocks.iter().any(|b| b.x == x && b.y == 0 && b.z == z),
+                    "missing block at ({x},0,{z})"
+                );
+            }
+        }
     }
 
     #[test]
