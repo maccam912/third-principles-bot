@@ -889,6 +889,11 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
             spawned,
         } => {
             if !*spawned {
+                eprintln!(
+                    "[build] spawning LLM request for '{}' with {} inventory item types",
+                    job.description,
+                    inventory.len()
+                );
                 let result = Arc::clone(result);
                 let description = job.description.clone();
                 let inventory = inventory.clone();
@@ -901,10 +906,17 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
 
             let llm_result = result.lock().clone();
             if let Some(outcome) = llm_result {
+                eprintln!("[build] LLM request completed for '{}'", job.description);
                 match outcome {
                     Ok(mut structure) => {
+                        eprintln!(
+                            "[build] LLM returned structure blocks={} materials={}",
+                            structure.blocks.len(),
+                            structure.materials.len()
+                        );
                         let missing = compute_missing(&structure, &*inventory);
                         if missing.is_empty() {
+                            eprintln!("[build] all required materials already available");
                             sort_blocks_by_y(&mut structure.blocks);
                             job.phase = BuildPhase::PlacingBlocks {
                                 structure,
@@ -913,6 +925,10 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                                 waiting_for_confirmation: false,
                             };
                         } else {
+                            eprintln!(
+                                "[build] missing {} material types, switching to collection",
+                                missing.len()
+                            );
                             job.phase = BuildPhase::CollectingResources {
                                 structure,
                                 missing,
@@ -921,6 +937,7 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                         }
                     }
                     Err(e) => {
+                        eprintln!("[build] LLM request failed: {e}");
                         bot.stop_pathfinding();
                         *state.mode.lock() = BotMode::Idle;
                         bot.chat(format!("Build failed: LLM error — {e}."));
