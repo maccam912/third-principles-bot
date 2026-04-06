@@ -234,7 +234,7 @@ pub fn compute_missing(
     missing
 }
 
-pub fn sort_blocks_by_y(blocks: &mut Vec<crate::llm::BlockEntry>) {
+pub fn sort_blocks_by_y(blocks: &mut [crate::llm::BlockEntry]) {
     blocks.sort_by_key(|b| b.y);
 }
 
@@ -699,8 +699,15 @@ fn nearest_collect_drop(
 
 pub enum CollectTickOutcome {
     Continue(CollectJob),
-    Done { collected: u32, name: String },
-    ExhaustedTargets { collected: u32, requested: u32, name: String },
+    Done {
+        collected: u32,
+        name: String,
+    },
+    ExhaustedTargets {
+        collected: u32,
+        requested: u32,
+        name: String,
+    },
 }
 
 fn collect_tick_inner(bot: &Client, mut job: CollectJob) -> CollectTickOutcome {
@@ -794,11 +801,15 @@ fn collect_tick(bot: Client, state: State, job: CollectJob) {
         }
         CollectTickOutcome::Done { collected, name } => {
             *state.mode.lock() = BotMode::Idle;
-            bot.chat(&format!("Collected {} {}.", collected, name));
+            bot.chat(format!("Collected {} {}.", collected, name));
         }
-        CollectTickOutcome::ExhaustedTargets { collected, requested, name } => {
+        CollectTickOutcome::ExhaustedTargets {
+            collected,
+            requested,
+            name,
+        } => {
             *state.mode.lock() = BotMode::Idle;
-            bot.chat(&format!(
+            bot.chat(format!(
                 "I only collected {}/{} {} before running out of targets.",
                 collected, requested, name
             ));
@@ -808,7 +819,11 @@ fn collect_tick(bot: Client, state: State, job: CollectJob) {
 
 fn build_tick(bot: Client, state: State, mut job: BuildJob) {
     match &mut job.phase {
-        BuildPhase::ScanningChests { chests, result, spawned } => {
+        BuildPhase::ScanningChests {
+            chests,
+            result,
+            spawned,
+        } => {
             if !*spawned {
                 let result = Arc::clone(result);
                 let bot_clone = bot.clone();
@@ -818,10 +833,26 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                     for chest_pos in chests {
                         let goal = RadiusGoal::new(chest_pos.center(), 3.0);
                         bot_clone.goto(goal).await;
-                        // TODO: open chest and read contents via azalea container API
-                        // When azalea exposes an async open_container method, use it here.
-                        // For now, chest contents are not scanned.
-                        eprintln!("[build] at chest {chest_pos:?}, container API not available yet");
+                        let Some(container) = bot_clone.open_container_at(chest_pos).await else {
+                            eprintln!("[build] failed to open chest at {chest_pos:?}");
+                            continue;
+                        };
+                        let Some(contents) = container.contents() else {
+                            eprintln!("[build] lost chest contents at {chest_pos:?}");
+                            continue;
+                        };
+                        for slot in contents {
+                            if !slot.is_present() {
+                                continue;
+                            }
+                            let raw = slot.kind().to_string();
+                            let id = if raw.contains(':') {
+                                raw
+                            } else {
+                                format!("minecraft:{raw}")
+                            };
+                            *inventory.entry(id).or_insert(0) += slot.count().max(0) as u32;
+                        }
                     }
                     *result.lock() = Some(inventory);
                 });
@@ -838,7 +869,11 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                         continue;
                     }
                     let raw = slot.kind().to_string();
-                    let id = if raw.contains(':') { raw } else { format!("minecraft:{raw}") };
+                    let id = if raw.contains(':') {
+                        raw
+                    } else {
+                        format!("minecraft:{raw}")
+                    };
                     *combined.entry(id).or_insert(0) += slot.count().max(0) as u32;
                 }
                 job.phase = BuildPhase::WaitingForLlm {
@@ -848,7 +883,11 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                 };
             }
         }
-        BuildPhase::WaitingForLlm { inventory, result, spawned } => {
+        BuildPhase::WaitingForLlm {
+            inventory,
+            result,
+            spawned,
+        } => {
             if !*spawned {
                 let result = Arc::clone(result);
                 let description = job.description.clone();
@@ -884,36 +923,40 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                     Err(e) => {
                         bot.stop_pathfinding();
                         *state.mode.lock() = BotMode::Idle;
-                        bot.chat(&format!("Build failed: LLM error — {e}."));
+                        bot.chat(format!("Build failed: LLM error — {e}."));
                         return;
                     }
                 }
             }
         }
-        BuildPhase::CollectingResources { structure, missing, active_job } => {
+        BuildPhase::CollectingResources {
+            structure,
+            missing,
+            active_job,
+        } => {
             // Pop from queue only when there's no active job
-            if active_job.is_none() {
-                if let Some((item_id, count)) = missing.pop_front() {
-                    let name = strip_namespace(&item_id).to_owned();
-                    let block_kind = BlockKind::from_str(&name).ok();
-                    let item_kind = ItemKind::from_str(&name).ok();
-                    match (block_kind, item_kind) {
-                        (Some(bk), Some(ik)) => {
-                            let target = CollectTarget::exact(name, bk, ik);
-                            let baseline = bot
-                                .menu()
-                                .contents()
-                                .into_iter()
-                                .filter(|s| s.kind() == ik)
-                                .map(|s| s.count().max(0) as u32)
-                                .sum();
-                            let mut cjob = CollectJob::new(target, count);
-                            cjob.baseline_count = baseline;
-                            *active_job = Some(cjob);
-                        }
-                        _ => {
-                            eprintln!("[build] can't collect unknown item {item_id}, skipping");
-                        }
+            if active_job.is_none()
+                && let Some((item_id, count)) = missing.pop_front()
+            {
+                let name = strip_namespace(&item_id).to_owned();
+                let block_kind = BlockKind::from_str(&name).ok();
+                let item_kind = ItemKind::from_str(&name).ok();
+                match (block_kind, item_kind) {
+                    (Some(bk), Some(ik)) => {
+                        let target = CollectTarget::exact(name, bk, ik);
+                        let baseline = bot
+                            .menu()
+                            .contents()
+                            .into_iter()
+                            .filter(|s| s.kind() == ik)
+                            .map(|s| s.count().max(0) as u32)
+                            .sum();
+                        let mut cjob = CollectJob::new(target, count);
+                        cjob.baseline_count = baseline;
+                        *active_job = Some(cjob);
+                    }
+                    _ => {
+                        eprintln!("[build] can't collect unknown item {item_id}, skipping");
                     }
                 }
             }
@@ -952,7 +995,7 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
             if *next_index >= structure.blocks.len() {
                 bot.stop_pathfinding();
                 *state.mode.lock() = BotMode::Idle;
-                bot.chat(&format!("Finished building {}.", job.description));
+                bot.chat(format!("Finished building {}.", job.description));
                 return;
             }
 
@@ -965,10 +1008,7 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
 
             if *waiting_for_confirmation {
                 let world = bot.world();
-                let current_kind = world
-                    .read()
-                    .get_block_state(target)
-                    .map(BlockKind::from);
+                let current_kind = world.read().get_block_state(target).map(BlockKind::from);
 
                 let expected_kind = BlockKind::from_str(strip_namespace(&block_entry.block)).ok();
 
@@ -982,7 +1022,7 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                         if *placement_attempts >= 3 {
                             bot.stop_pathfinding();
                             *state.mode.lock() = BotMode::Idle;
-                            bot.chat(&format!(
+                            bot.chat(format!(
                                 "Build failed: couldn't place {} at {},{},{} after 3 attempts. Aborting.",
                                 block_entry.block, target.x, target.y, target.z
                             ));
@@ -998,7 +1038,7 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                         if *placement_attempts >= 3 {
                             bot.stop_pathfinding();
                             *state.mode.lock() = BotMode::Idle;
-                            bot.chat(&format!(
+                            bot.chat(format!(
                                 "Build failed: couldn't place {} at {},{},{} after 3 attempts. Aborting.",
                                 block_entry.block, target.x, target.y, target.z
                             ));
@@ -1009,11 +1049,11 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                 }
             } else {
                 let item_name = strip_namespace(&block_entry.block);
-                if let Ok(item_kind) = ItemKind::from_str(item_name) {
-                    if equip_item(&bot, item_kind) {
-                        *state.mode.lock() = BotMode::Building(job);
-                        return;
-                    }
+                if let Ok(item_kind) = ItemKind::from_str(item_name)
+                    && equip_item(&bot, item_kind)
+                {
+                    *state.mode.lock() = BotMode::Building(job);
+                    return;
                 }
 
                 if bot.position().distance_to(target.center()) > 4.5 {
@@ -1426,7 +1466,10 @@ mod tests {
         let mut materials = std::collections::HashMap::new();
         materials.insert("minecraft:dirt".to_owned(), 10u32);
         materials.insert("minecraft:cobblestone".to_owned(), 5u32);
-        let structure = Structure { blocks: vec![], materials };
+        let structure = Structure {
+            blocks: vec![],
+            materials,
+        };
 
         let mut inventory = std::collections::HashMap::new();
         inventory.insert("minecraft:dirt".to_owned(), 3u32);
@@ -1442,7 +1485,10 @@ mod tests {
         use crate::llm::Structure;
         let mut materials = std::collections::HashMap::new();
         materials.insert("minecraft:dirt".to_owned(), 10u32);
-        let structure = Structure { blocks: vec![], materials };
+        let structure = Structure {
+            blocks: vec![],
+            materials,
+        };
 
         let mut inventory = std::collections::HashMap::new();
         inventory.insert("minecraft:dirt".to_owned(), 15u32);
@@ -1455,9 +1501,24 @@ mod tests {
     fn sort_blocks_by_y_orders_ascending() {
         use crate::llm::BlockEntry;
         let mut blocks = vec![
-            BlockEntry { x: 0, y: 3, z: 0, block: "minecraft:dirt".to_owned() },
-            BlockEntry { x: 0, y: 1, z: 0, block: "minecraft:dirt".to_owned() },
-            BlockEntry { x: 0, y: 2, z: 0, block: "minecraft:dirt".to_owned() },
+            BlockEntry {
+                x: 0,
+                y: 3,
+                z: 0,
+                block: "minecraft:dirt".to_owned(),
+            },
+            BlockEntry {
+                x: 0,
+                y: 1,
+                z: 0,
+                block: "minecraft:dirt".to_owned(),
+            },
+            BlockEntry {
+                x: 0,
+                y: 2,
+                z: 0,
+                block: "minecraft:dirt".to_owned(),
+            },
         ];
         sort_blocks_by_y(&mut blocks);
         assert_eq!(blocks[0].y, 1);

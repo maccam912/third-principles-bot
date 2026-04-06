@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlockEntry {
@@ -55,10 +55,10 @@ pub async fn call_llm(
 ) -> Result<Structure, String> {
     let base_url = std::env::var("OPENROUTER_BASE_URL")
         .map_err(|_| "OPENROUTER_BASE_URL not set".to_owned())?;
-    let api_key = std::env::var("OPENROUTER_API_KEY")
-        .map_err(|_| "OPENROUTER_API_KEY not set".to_owned())?;
-    let model = std::env::var("OPENROUTER_MODEL")
-        .map_err(|_| "OPENROUTER_MODEL not set".to_owned())?;
+    let api_key =
+        std::env::var("OPENROUTER_API_KEY").map_err(|_| "OPENROUTER_API_KEY not set".to_owned())?;
+    let model =
+        std::env::var("OPENROUTER_MODEL").map_err(|_| "OPENROUTER_MODEL not set".to_owned())?;
 
     let inventory_str = if inventory.is_empty() {
         "  (empty)".to_owned()
@@ -83,10 +83,18 @@ pub async fn call_llm(
     let request = ChatRequest {
         model,
         messages: vec![
-            ChatMessage { role: "system", content: system.to_owned() },
-            ChatMessage { role: "user", content: user },
+            ChatMessage {
+                role: "system",
+                content: system.to_owned(),
+            },
+            ChatMessage {
+                role: "user",
+                content: user,
+            },
         ],
-        response_format: ResponseFormat { kind: "json_object" },
+        response_format: ResponseFormat {
+            kind: "json_object",
+        },
     };
 
     let client = reqwest::Client::new();

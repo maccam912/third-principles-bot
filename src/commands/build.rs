@@ -39,7 +39,9 @@ fn execute_build(ctx: &Ctx) -> i32 {
         },
     });
 
-    source.reply(format!("Building: {description}. Scanning nearby chests..."));
+    source.reply(format!(
+        "Building: {description}. Scanning nearby chests..."
+    ));
     1
 }
 
