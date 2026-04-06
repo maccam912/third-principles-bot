@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Public types (canonical, used throughout the codebase)
@@ -34,6 +36,7 @@ struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
     response_format: ResponseFormat,
+    stream: bool,
 }
 
 #[derive(Serialize)]
@@ -42,19 +45,12 @@ struct ResponseFormat {
     kind: &'static str,
 }
 
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(Deserialize)]
-struct ChatChoice {
-    message: ChatChoiceMessage,
-}
-
-#[derive(Deserialize)]
-struct ChatChoiceMessage {
-    content: String,
+#[derive(Debug, PartialEq, Eq)]
+enum StreamEvent {
+    Content(String),
+    Error(String),
+    Done,
+    Ignore,
 }
 
 // ---------------------------------------------------------------------------
@@ -112,13 +108,71 @@ fn content_preview(content: &str, max_len: usize) -> String {
     format!("{}...", &content[..max_len])
 }
 
+fn parse_stream_payload(payload: &str) -> Result<StreamEvent, String> {
+    let payload = payload.trim();
+    if payload.is_empty() {
+        return Ok(StreamEvent::Ignore);
+    }
+    if payload == "[DONE]" {
+        return Ok(StreamEvent::Done);
+    }
+
+    let value: Value = serde_json::from_str(payload)
+        .map_err(|e| format!("failed to parse stream payload: {e}"))?;
+
+    if let Some(message) = value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+    {
+        return Ok(StreamEvent::Error(message.to_owned()));
+    }
+
+    if let Some(content) = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| delta.get("content"))
+        .and_then(Value::as_str)
+    {
+        if content.is_empty() {
+            return Ok(StreamEvent::Ignore);
+        }
+        return Ok(StreamEvent::Content(content.to_owned()));
+    }
+
+    Ok(StreamEvent::Ignore)
+}
+
+fn extract_sse_payloads(event_text: &str) -> Vec<&str> {
+    event_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .collect()
+}
+
+fn find_sse_event_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
+    buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|pos| (pos, 4))
+        .or_else(|| {
+            buffer
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|pos| (pos, 2))
+        })
+}
+
 // ---------------------------------------------------------------------------
 // LLM response parsers
 // ---------------------------------------------------------------------------
 
 fn parse_tuple_format(content: &str) -> Result<Structure, String> {
-    let fmt: TupleFormat = serde_json::from_str(content)
-        .map_err(|e| format!("tuple format parse error: {e}"))?;
+    let fmt: TupleFormat =
+        serde_json::from_str(content).map_err(|e| format!("tuple format parse error: {e}"))?;
 
     let mut blocks = Vec::with_capacity(fmt.b.len());
     let mut materials: HashMap<String, u32> = HashMap::new();
@@ -141,8 +195,8 @@ fn parse_tuple_format(content: &str) -> Result<Structure, String> {
 }
 
 fn parse_grid_format(content: &str) -> Result<Structure, String> {
-    let fmt: GridFormat = serde_json::from_str(content)
-        .map_err(|e| format!("grid format parse error: {e}"))?;
+    let fmt: GridFormat =
+        serde_json::from_str(content).map_err(|e| format!("grid format parse error: {e}"))?;
 
     let [ox, oy, oz] = fmt.offset;
     let mut blocks = Vec::new();
@@ -158,9 +212,10 @@ fn parse_grid_format(content: &str) -> Result<Structure, String> {
                 }
                 let x = xi as i32 + ox;
                 let ch_str = ch.to_string();
-                let short_name = fmt.p.get(&ch_str).ok_or_else(|| {
-                    format!("palette character '{ch}' not defined in palette")
-                })?;
+                let short_name = fmt
+                    .p
+                    .get(&ch_str)
+                    .ok_or_else(|| format!("palette character '{ch}' not defined in palette"))?;
                 let block = format!("minecraft:{short_name}");
                 *materials.entry(block.clone()).or_insert(0) += 1;
                 blocks.push(BlockEntry { x, y, z, block });
@@ -172,8 +227,7 @@ fn parse_grid_format(content: &str) -> Result<Structure, String> {
 }
 
 fn parse_llm_response(content: &str) -> Result<Structure, String> {
-    let v: serde_json::Value =
-        serde_json::from_str(content).map_err(|e| format!("invalid JSON: {e}"))?;
+    let v: Value = serde_json::from_str(content).map_err(|e| format!("invalid JSON: {e}"))?;
 
     if v.get("l").is_some() {
         parse_grid_format(content)
@@ -198,10 +252,14 @@ async fn call_api_once(
     model: &str,
     messages: Vec<ChatMessage>,
 ) -> Result<String, String> {
+    let started_at = Instant::now();
     let request = ChatRequest {
         model: model.to_owned(),
         messages,
-        response_format: ResponseFormat { kind: "json_object" },
+        response_format: ResponseFormat {
+            kind: "json_object",
+        },
+        stream: true,
     };
 
     eprintln!("[llm] sending POST {url}");
@@ -225,19 +283,62 @@ async fn call_api_once(
         return Err(format!("HTTP {status}: {body}"));
     }
 
-    eprintln!("[llm] parsing API response body");
-    let chat_resp: ChatResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("failed to parse API response: {e}"))?;
+    eprintln!("[llm] reading streaming API response body");
+    let mut response = response;
+    let mut pending = Vec::<u8>::new();
+    let mut content = String::new();
+    let mut done = false;
+    let mut next_progress_log = started_at + Duration::from_secs(10);
 
-    let content = chat_resp
-        .choices
-        .into_iter()
-        .next()
-        .ok_or_else(|| "no choices in LLM response".to_owned())?
-        .message
-        .content;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("failed to read API response body: {e}"))?
+    {
+        pending.extend_from_slice(&chunk);
+
+        while let Some((delim, delim_len)) = find_sse_event_delimiter(&pending) {
+            let event_bytes: Vec<u8> = pending.drain(..delim + delim_len).collect();
+            let event_text = String::from_utf8_lossy(&event_bytes);
+
+            for payload in extract_sse_payloads(&event_text) {
+                match parse_stream_payload(payload)? {
+                    StreamEvent::Content(delta) => content.push_str(&delta),
+                    StreamEvent::Error(message) => {
+                        return Err(format!("stream error: {message}"));
+                    }
+                    StreamEvent::Done => {
+                        done = true;
+                        break;
+                    }
+                    StreamEvent::Ignore => {}
+                }
+            }
+
+            if done {
+                break;
+            }
+        }
+
+        if Instant::now() >= next_progress_log {
+            eprintln!(
+                "[llm] stream progress elapsed_ms={} content_chars={} preview={}",
+                started_at.elapsed().as_millis(),
+                content.len(),
+                content_preview(&content, 120)
+            );
+            next_progress_log += Duration::from_secs(10);
+        }
+
+        if done {
+            break;
+        }
+    }
+
+    if !done {
+        return Err("stream ended before [DONE] marker".to_owned());
+    }
+
     eprintln!(
         "[llm] received content chars={} preview={}",
         content.len(),
@@ -328,7 +429,11 @@ pub async fn call_llm(
         },
     ];
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(90))
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let content = call_api_once(&client, &url, &api_key, &model, base_messages).await?;
@@ -370,8 +475,7 @@ pub async fn call_llm(
                     ),
                 },
             ];
-            let content2 =
-                call_api_once(&client, &url, &api_key, &model, repair_messages).await?;
+            let content2 = call_api_once(&client, &url, &api_key, &model, repair_messages).await?;
             let structure = parse_llm_response(&content2).map_err(|e2| {
                 format!(
                     "failed to parse structure after retry: {e2}\nContent: {}",
@@ -391,6 +495,43 @@ pub async fn call_llm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_payload_extracts_delta_content() {
+        let payload = r#"{
+            "choices": [
+                { "delta": { "content": "{\"blocks\":[" } }
+            ]
+        }"#;
+
+        let event = parse_stream_payload(payload).unwrap();
+
+        assert_eq!(event, StreamEvent::Content("{\"blocks\":[".to_owned()));
+    }
+
+    #[test]
+    fn stream_payload_recognizes_done_marker() {
+        let event = parse_stream_payload("[DONE]").unwrap();
+
+        assert_eq!(event, StreamEvent::Done);
+    }
+
+    #[test]
+    fn stream_payload_surfaces_top_level_error() {
+        let payload = r#"{
+            "error": { "message": "Provider disconnected unexpectedly" },
+            "choices": [
+                { "delta": { "content": "" }, "finish_reason": "error" }
+            ]
+        }"#;
+
+        let event = parse_stream_payload(payload).unwrap();
+
+        assert_eq!(
+            event,
+            StreamEvent::Error("Provider disconnected unexpectedly".to_owned())
+        );
+    }
 
     #[test]
     fn inventory_summary_reports_total_and_sample_items() {
@@ -433,7 +574,12 @@ mod tests {
     fn parse_tuple_format_prepends_minecraft_namespace() {
         let json = r#"{"p":["cobblestone"],"b":[[0,0,0,0],[0,1,0,0]]}"#;
         let structure = parse_llm_response(json).unwrap();
-        assert!(structure.blocks.iter().all(|b| b.block.starts_with("minecraft:")));
+        assert!(
+            structure
+                .blocks
+                .iter()
+                .all(|b| b.block.starts_with("minecraft:"))
+        );
     }
 
     #[test]
@@ -450,11 +596,13 @@ mod tests {
         assert_eq!(structure.blocks.len(), 6);
         assert!(structure.blocks.iter().all(|b| b.block == "minecraft:dirt"));
         assert_eq!(structure.materials["minecraft:dirt"], 6);
-        // Verify all 6 positions: x in [-1,0,1] × z in [-1,0] at y=0
         for x in [-1i32, 0, 1] {
             for z in [-1i32, 0] {
                 assert!(
-                    structure.blocks.iter().any(|b| b.x == x && b.y == 0 && b.z == z),
+                    structure
+                        .blocks
+                        .iter()
+                        .any(|b| b.x == x && b.y == 0 && b.z == z),
                     "missing block at ({x},0,{z})"
                 );
             }
@@ -466,11 +614,13 @@ mod tests {
         let json = r#"{"p":{"s":"stone"},"l":["ss/ss"]}"#;
         let structure = parse_llm_response(json).unwrap();
         assert_eq!(structure.blocks.len(), 4);
-        // offset defaults to [0,0,0]: positions (0,0,0),(1,0,0),(0,0,1),(1,0,1)
         for x in [0i32, 1] {
             for z in [0i32, 1] {
                 assert!(
-                    structure.blocks.iter().any(|b| b.x == x && b.y == 0 && b.z == z),
+                    structure
+                        .blocks
+                        .iter()
+                        .any(|b| b.x == x && b.y == 0 && b.z == z),
                     "missing block at ({x},0,{z})"
                 );
             }
@@ -481,7 +631,6 @@ mod tests {
     fn parse_grid_format_skips_dots() {
         let json = r#"{"p":{"s":"stone"},"l":["s.s/..."]}"#;
         let structure = parse_llm_response(json).unwrap();
-        // Only 2 stone blocks; dots and the all-dot row produce nothing
         assert_eq!(structure.blocks.len(), 2);
     }
 
@@ -492,9 +641,18 @@ mod tests {
         assert_eq!(structure.blocks.len(), 8);
         assert_eq!(structure.materials["minecraft:dirt"], 4);
         assert_eq!(structure.materials["minecraft:glass"], 4);
-        // y=0 layer is dirt, y=1 layer is glass
-        assert!(structure.blocks.iter().any(|b| b.y == 0 && b.block == "minecraft:dirt"));
-        assert!(structure.blocks.iter().any(|b| b.y == 1 && b.block == "minecraft:glass"));
+        assert!(
+            structure
+                .blocks
+                .iter()
+                .any(|b| b.y == 0 && b.block == "minecraft:dirt")
+        );
+        assert!(
+            structure
+                .blocks
+                .iter()
+                .any(|b| b.y == 1 && b.block == "minecraft:glass")
+        );
     }
 
     #[test]
