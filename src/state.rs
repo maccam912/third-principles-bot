@@ -441,6 +441,21 @@ where
         .min_by_key(|candidate| block_distance_sq(*candidate, stance))
 }
 
+/// Returns `true` when the bot must navigate before placing a block.
+///
+/// Navigation is needed when:
+/// - The bot is too far from the chosen stance position (`distance_to_stance > 1.5`), OR
+/// - The bot's block position is the same as the target — the Minecraft server
+///   rejects placement when an entity's bounding box overlaps the target.
+pub fn needs_navigation_for_placement(
+    bot_block_pos: BlockPos,
+    target: BlockPos,
+    _stance: BlockPos,
+    distance_to_stance: f64,
+) -> bool {
+    bot_block_pos == target || distance_to_stance > 1.5
+}
+
 fn placement_interaction_point(support: BlockPos, target: BlockPos) -> Vec3 {
     let support_center = support.center();
     let target_center = target.center();
@@ -1257,7 +1272,16 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                     return;
                 };
 
-                if bot.position().distance_to(stance.center()) > 1.5 {
+                let bot_block = BlockPos::from(bot.position());
+                let distance_to_stance = bot.position().distance_to(stance.center());
+                if needs_navigation_for_placement(bot_block, target, stance, distance_to_stance) {
+                    if bot_block == target {
+                        tracing::warn!(
+                            x = target.x, y = target.y, z = target.z,
+                            stance_x = stance.x, stance_y = stance.y, stance_z = stance.z,
+                            "bot is standing at target block, navigating to stance"
+                        );
+                    }
                     if !bot.is_calculating_path() {
                         bot.start_goto_with_opts(
                             RadiusGoal::new(stance.center(), 1.0),
@@ -1419,8 +1443,9 @@ mod tests {
         ToolSearchOutcome, choose_next_collect_block, choose_placement_support_block,
         choose_safe_action_stance, choose_safe_collect_target, collect_progress_from_counts,
         compute_missing, log_collect_tool_search_attempt, log_collect_tool_search_outcome,
-        next_collect_phase_after_search, normalize_collect_candidates, plan_tool_equip,
-        preferred_tool_for_collect_target, sort_blocks_by_y, strip_namespace,
+        needs_navigation_for_placement, next_collect_phase_after_search,
+        normalize_collect_candidates, plan_tool_equip, preferred_tool_for_collect_target,
+        sort_blocks_by_y, strip_namespace,
     };
     use std::collections::HashSet;
 
@@ -1844,5 +1869,41 @@ mod tests {
         assert_eq!(blocks[0].y, 1);
         assert_eq!(blocks[1].y, 2);
         assert_eq!(blocks[2].y, 3);
+    }
+
+    #[test]
+    fn placement_needs_navigation_when_bot_stands_at_target() {
+        let target = azalea::BlockPos::new(0, 64, 0);
+        let stance = azalea::BlockPos::new(1, 64, 0);
+        // Bot is at the target (distance to stance ~1.0, which is <= 1.5)
+        let bot_block = target;
+        assert!(
+            needs_navigation_for_placement(bot_block, target, stance, 1.0),
+            "should require navigation when bot occupies the target block"
+        );
+    }
+
+    #[test]
+    fn placement_needs_navigation_when_far_from_stance() {
+        let target = azalea::BlockPos::new(0, 64, 0);
+        let stance = azalea::BlockPos::new(1, 64, 0);
+        // Bot is far from the stance
+        let bot_block = azalea::BlockPos::new(10, 64, 0);
+        assert!(
+            needs_navigation_for_placement(bot_block, target, stance, 10.0),
+            "should require navigation when bot is far from stance"
+        );
+    }
+
+    #[test]
+    fn placement_ready_when_at_stance_and_not_at_target() {
+        let target = azalea::BlockPos::new(0, 64, 0);
+        let stance = azalea::BlockPos::new(1, 64, 0);
+        // Bot is at the stance, not at the target
+        let bot_block = stance;
+        assert!(
+            !needs_navigation_for_placement(bot_block, target, stance, 0.3),
+            "should NOT require navigation when bot is at stance and not at target"
+        );
     }
 }

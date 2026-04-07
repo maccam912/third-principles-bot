@@ -2,6 +2,7 @@
 name = "third-principles-bot"
 version = "0.1.0"
 edition = "2024"
+default-run = "third-principles-bot"
 
 [dependencies]
 azalea = { git = "https://github.com/azalea-rs/azalea", branch = "1.21.11" }
