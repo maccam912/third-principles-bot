@@ -676,7 +676,6 @@ pub fn needs_navigation_for_placement(
 
 /// Returns `true` if health decreased (indicating damage taken).
 /// Returns `false` if health is the same, increased, or previous was 0 (respawn).
-#[allow(dead_code)] // wired in Task 5
 fn detected_health_drop(previous: f32, current: f32) -> bool {
     previous > 0.0 && current < previous
 }
@@ -1654,6 +1653,36 @@ pub async fn handle(bot: Client, event: azalea::Event, state: State) -> eyre::Re
 
 #[tracing::instrument(skip_all)]
 fn tick(bot: Client, state: State) {
+    // --- Health monitoring / combat interrupt ---
+    let current_health = bot.health();
+    let previous_health = {
+        let mut h = state.last_known_health.lock();
+        let prev = *h;
+        *h = current_health;
+        prev
+    };
+
+    if detected_health_drop(previous_health, current_health) {
+        let mode = state.mode.lock().clone();
+        if !matches!(mode, BotMode::Combat(_)) {
+            tracing::info!(
+                previous_health,
+                current_health,
+                damage = previous_health - current_health,
+                interrupted_mode = mode_name(&mode),
+                "damage detected, entering combat mode"
+            );
+            bot.stop_pathfinding();
+            *state.mode.lock() = BotMode::Combat(CombatJob {
+                previous_mode: Box::new(mode),
+                phase: CombatPhase::Equipping,
+                health_at_entry: current_health,
+                started_at_tick: bot.ticks_connected(),
+            });
+            return;
+        }
+    }
+
     let mode = state.mode.lock().clone();
     tracing::trace!(mode = mode_name(&mode), tick = bot.ticks_connected(), "tick");
     match mode {
