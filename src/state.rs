@@ -767,34 +767,19 @@ where
 
 /// Returns `true` when the bot must navigate before placing a block.
 ///
-/// Navigation is needed when:
-/// - The bot is too far from the chosen stance position (`distance_to_stance > 1.5`), OR
-/// - The bot's block position is the same as the target — the Minecraft server
-///   rejects placement when an entity's bounding box overlaps the target, OR
-/// - The bot is directly adjacent to the target (manhattan distance 1) and the
-///   stance is further away — the bot can easily drift onto the target from an
-///   adjacent position, so we navigate to the proper stance instead.
+/// Navigation is needed when the bot's block position differs from the chosen
+/// stance.  The stance is carefully selected to have line-of-sight to the
+/// support block's face; placing from any other position risks the server
+/// raycast hitting an intermediate block (natural terrain, previously-placed
+/// blocks, etc.) instead of the intended support face.
 pub fn needs_navigation_for_placement(
     bot_block_pos: BlockPos,
-    target: BlockPos,
+    _target: BlockPos,
     stance: BlockPos,
-    distance_to_stance: f64,
+    _distance_to_stance: f64,
 ) -> bool {
-    if bot_block_pos == target {
-        return true;
-    }
-    if distance_to_stance > 1.5 {
-        return true;
-    }
-    // If bot is adjacent to target but not at the preferred stance, navigate.
-    // This prevents the bot from drifting onto the target during placement.
-    let manhattan =
-        (bot_block_pos.x - target.x).abs() + (bot_block_pos.z - target.z).abs();
-    let y_diff = (bot_block_pos.y - target.y).abs();
-    if manhattan <= 1 && y_diff <= 1 && bot_block_pos != stance {
-        return true;
-    }
-    false
+    // Simple check: bot must be standing in the same block as the stance.
+    bot_block_pos != stance
 }
 
 /// Returns `true` if health decreased (indicating damage taken).
@@ -2443,11 +2428,10 @@ mod tests {
     fn placement_needs_navigation_when_bot_stands_at_target() {
         let target = azalea::BlockPos::new(0, 64, 0);
         let stance = azalea::BlockPos::new(1, 64, 0);
-        // Bot is at the target (distance to stance ~1.0, which is <= 1.5)
-        let bot_block = target;
+        let bot_block = target; // not at stance
         assert!(
             needs_navigation_for_placement(bot_block, target, stance, 1.0),
-            "should require navigation when bot occupies the target block"
+            "should require navigation when bot is not at stance"
         );
     }
 
@@ -2455,8 +2439,7 @@ mod tests {
     fn placement_needs_navigation_when_far_from_stance() {
         let target = azalea::BlockPos::new(0, 64, 0);
         let stance = azalea::BlockPos::new(1, 64, 0);
-        // Bot is far from the stance
-        let bot_block = azalea::BlockPos::new(10, 64, 0);
+        let bot_block = azalea::BlockPos::new(10, 64, 0); // not at stance
         assert!(
             needs_navigation_for_placement(bot_block, target, stance, 10.0),
             "should require navigation when bot is far from stance"
@@ -2467,11 +2450,10 @@ mod tests {
     fn placement_ready_when_at_stance_and_not_at_target() {
         let target = azalea::BlockPos::new(0, 64, 0);
         let stance = azalea::BlockPos::new(1, 64, 0);
-        // Bot is at the stance, not at the target
         let bot_block = stance;
         assert!(
             !needs_navigation_for_placement(bot_block, target, stance, 0.3),
-            "should NOT require navigation when bot is at stance and not at target"
+            "should NOT require navigation when bot is at stance"
         );
     }
 
@@ -2479,11 +2461,10 @@ mod tests {
     fn placement_needs_navigation_when_adjacent_to_target_but_not_at_stance() {
         let target = azalea::BlockPos::new(0, 64, 0);
         let stance = azalea::BlockPos::new(2, 64, 0); // distance-2 stance
-        // Bot is adjacent to target (manhattan 1) but not at the preferred stance
-        let bot_block = azalea::BlockPos::new(1, 64, 0);
+        let bot_block = azalea::BlockPos::new(1, 64, 0); // not at stance
         assert!(
             needs_navigation_for_placement(bot_block, target, stance, 1.0),
-            "should require navigation when bot is adjacent to target but not at stance"
+            "should require navigation when bot is not at stance"
         );
     }
 
