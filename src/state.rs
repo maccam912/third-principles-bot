@@ -1724,13 +1724,13 @@ mod tests {
     use azalea::registry::builtin::{BlockKind, ItemKind};
 
     use super::{
-        CollectJob, CollectPhase, CollectProgress, CollectTarget, PreferredTool, ToolEquipPlan,
-        ToolSearchOutcome, choose_next_collect_block, choose_placement_support_block,
-        choose_safe_action_stance, choose_safe_collect_target, collect_progress_from_counts,
-        compute_missing, log_collect_tool_search_attempt, log_collect_tool_search_outcome,
-        needs_navigation_for_placement, next_collect_phase_after_search,
-        normalize_collect_candidates, plan_tool_equip, preferred_tool_for_collect_target,
-        sort_blocks_by_y, strip_namespace,
+        BotMode, CollectJob, CollectPhase, CollectProgress, CollectTarget, CombatJob, CombatPhase,
+        PreferredTool, ToolEquipPlan, ToolSearchOutcome, choose_next_collect_block,
+        choose_placement_support_block, choose_safe_action_stance, choose_safe_collect_target,
+        collect_progress_from_counts, compute_missing, log_collect_tool_search_attempt,
+        log_collect_tool_search_outcome, needs_navigation_for_placement,
+        next_collect_phase_after_search, normalize_collect_candidates, plan_tool_equip,
+        preferred_tool_for_collect_target, sort_blocks_by_y, strip_namespace,
     };
     use std::collections::HashSet;
 
@@ -2253,5 +2253,31 @@ mod tests {
     fn health_drop_not_detected_for_zero_previous() {
         // After respawn, previous health might be 0. Don't trigger combat.
         assert!(!super::detected_health_drop(0.0, 20.0));
+    }
+
+    #[test]
+    fn combat_job_preserves_previous_mode() {
+        let collect_job = CollectJob::new(
+            CollectTarget::wood(),
+            10,
+            azalea::BlockPos::new(0, 64, 0),
+        );
+
+        let combat = CombatJob {
+            previous_mode: Box::new(BotMode::Collecting(collect_job.clone())),
+            phase: CombatPhase::Equipping,
+            health_at_entry: 15.0,
+            started_at_tick: 100,
+        };
+
+        // Verify previous_mode round-trips
+        let restored = *combat.previous_mode;
+        match restored {
+            BotMode::Collecting(restored_job) => {
+                assert_eq!(restored_job.target, collect_job.target);
+                assert_eq!(restored_job.requested_count, collect_job.requested_count);
+            }
+            _ => panic!("expected Collecting mode after restore"),
+        }
     }
 }
