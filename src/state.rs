@@ -69,6 +69,7 @@ pub struct CollectTarget {
 pub enum PreferredTool {
     Axe,
     Pickaxe,
+    Sword,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -585,6 +586,12 @@ fn tool_matches(item: ItemKind, preferred_tool: PreferredTool) -> bool {
             | (PreferredTool::Pickaxe, ItemKind::IronPickaxe)
             | (PreferredTool::Pickaxe, ItemKind::DiamondPickaxe)
             | (PreferredTool::Pickaxe, ItemKind::NetheritePickaxe)
+            | (PreferredTool::Sword, ItemKind::WoodenSword)
+            | (PreferredTool::Sword, ItemKind::StoneSword)
+            | (PreferredTool::Sword, ItemKind::GoldenSword)
+            | (PreferredTool::Sword, ItemKind::IronSword)
+            | (PreferredTool::Sword, ItemKind::DiamondSword)
+            | (PreferredTool::Sword, ItemKind::NetheriteSword)
     )
 }
 
@@ -593,6 +600,7 @@ fn preferred_tool_name(preferred_tool: PreferredTool) -> &'static str {
     match preferred_tool {
         PreferredTool::Axe => "axe",
         PreferredTool::Pickaxe => "pickaxe",
+        PreferredTool::Sword => "sword",
     }
 }
 
@@ -676,6 +684,21 @@ pub fn plan_tool_equip(
     }
 
     None
+}
+
+/// Pick the best melee weapon: try Sword first, then Axe.
+/// Returns `None` if no weapon found (bot fights with fists).
+pub fn plan_combat_weapon_equip(
+    slots: &[Option<ItemKind>],
+    hotbar_slots: std::ops::RangeInclusive<usize>,
+    selected_hotbar_index: u8,
+) -> Option<ToolEquipPlan> {
+    // Prefer sword
+    if let Some(plan) = plan_tool_equip(slots, hotbar_slots.clone(), selected_hotbar_index, PreferredTool::Sword) {
+        return Some(plan);
+    }
+    // Fall back to axe
+    plan_tool_equip(slots, hotbar_slots, selected_hotbar_index, PreferredTool::Axe)
 }
 
 #[tracing::instrument(skip_all, fields(target_name = %target.name))]
@@ -1938,5 +1961,50 @@ mod tests {
             !needs_navigation_for_placement(bot_block, target, stance, 0.3),
             "should NOT require navigation when bot is at stance and not at target"
         );
+    }
+
+    #[test]
+    fn sword_matches_preferred_weapon() {
+        assert!(super::tool_matches(ItemKind::DiamondSword, PreferredTool::Sword));
+        assert!(super::tool_matches(ItemKind::IronSword, PreferredTool::Sword));
+        assert!(super::tool_matches(ItemKind::StoneSword, PreferredTool::Sword));
+        assert!(super::tool_matches(ItemKind::WoodenSword, PreferredTool::Sword));
+        assert!(super::tool_matches(ItemKind::GoldenSword, PreferredTool::Sword));
+        assert!(super::tool_matches(ItemKind::NetheriteSword, PreferredTool::Sword));
+        assert!(!super::tool_matches(ItemKind::DiamondAxe, PreferredTool::Sword));
+    }
+
+    #[test]
+    fn combat_equip_prefers_sword_over_axe() {
+        let mut slots = vec![None; 46];
+        slots[5] = Some(ItemKind::IronSword);
+        slots[38] = Some(ItemKind::IronAxe);
+        let plan = super::plan_combat_weapon_equip(&slots, 36..=44, 0);
+        assert_eq!(
+            plan,
+            Some(ToolEquipPlan::MoveToSelectedHotbar {
+                source_slot: 5,
+                hotbar_slot: 36,
+                hotbar_index: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn combat_equip_falls_back_to_axe_when_no_sword() {
+        let mut slots = vec![None; 46];
+        slots[38] = Some(ItemKind::IronAxe);
+        let plan = super::plan_combat_weapon_equip(&slots, 36..=44, 0);
+        assert_eq!(
+            plan,
+            Some(ToolEquipPlan::SelectHotbar { hotbar_index: 2 })
+        );
+    }
+
+    #[test]
+    fn combat_equip_returns_none_when_no_weapons() {
+        let slots = vec![None; 46];
+        let plan = super::plan_combat_weapon_equip(&slots, 36..=44, 0);
+        assert_eq!(plan, None);
     }
 }
