@@ -8,11 +8,11 @@ use azalea::{
     BlockPos, Client, Vec3,
     ecs::{
         prelude::{Component, Entity},
-        query::With,
+        query::{With, Without},
     },
     entity::{
-        Position,
-        metadata::{Item, ItemItem},
+        Dead, LocalEntity, Position,
+        metadata::{AbstractMonster, Item, ItemItem},
     },
     pathfinder::{
         PathfinderClientExt, PathfinderOpts,
@@ -82,6 +82,194 @@ pub enum ToolEquipPlan {
         hotbar_slot: usize,
         hotbar_index: u8,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Combat tick logic
+// ---------------------------------------------------------------------------
+
+const COMBAT_TIMEOUT_TICKS: u64 = 600; // 30 seconds at 20 tps
+const COMBAT_SCAN_RANGE: f64 = 16.0;
+const MELEE_REACH: f64 = 4.0;
+
+/// Find the nearest hostile mob within `max_range` blocks of the bot.
+/// Returns the entity and its position, or `None` if no hostiles nearby.
+fn find_nearest_hostile(bot: &Client, max_range: f64) -> Option<(Entity, Vec3)> {
+    let origin = bot.eye_position();
+    let mut ecs = bot.ecs.write();
+    let mut query = ecs.query_filtered::<(Entity, &Position), (With<AbstractMonster>, Without<LocalEntity>, Without<Dead>)>();
+
+    let mut nearest: Option<(Entity, Vec3, f64)> = None;
+
+    for (entity, pos) in query.iter(&ecs) {
+        let mob_pos: Vec3 = **pos;
+        let dist = origin.distance_to(mob_pos);
+        if dist <= max_range
+            && (nearest.is_none() || dist < nearest.unwrap().2)
+        {
+            nearest = Some((entity, mob_pos, dist));
+        }
+    }
+
+    nearest.map(|(e, p, _)| (e, p))
+}
+
+/// Equip the best available melee weapon (sword > axe > fists).
+/// Returns `true` if a weapon was equipped, `false` if fighting bare-handed.
+#[tracing::instrument(skip_all)]
+fn equip_combat_weapon(bot: &Client) -> bool {
+    let menu = bot.menu();
+    let slots = menu
+        .slots()
+        .into_iter()
+        .map(|stack| stack.is_present().then(|| stack.kind()))
+        .collect::<Vec<_>>();
+    let hotbar_slots = menu.hotbar_slots_range();
+    let selected_hotbar_index = bot.selected_hotbar_slot();
+
+    let Some(plan) = plan_combat_weapon_equip(&slots, hotbar_slots.clone(), selected_hotbar_index) else {
+        tracing::debug!("no weapon found, fighting with fists");
+        return false;
+    };
+
+    match plan {
+        ToolEquipPlan::SelectHotbar { hotbar_index } => {
+            bot.set_selected_hotbar_slot(hotbar_index);
+            tracing::info!(hotbar_index, "equipped weapon from hotbar");
+        }
+        ToolEquipPlan::MoveToSelectedHotbar {
+            source_slot,
+            hotbar_slot,
+            hotbar_index,
+        } => {
+            let Some(inventory) = bot.open_inventory() else {
+                return false;
+            };
+            inventory.left_click(source_slot);
+            inventory.left_click(hotbar_slot);
+            inventory.left_click(source_slot);
+            bot.set_selected_hotbar_slot(hotbar_index);
+            tracing::info!(source_slot, hotbar_slot, hotbar_index, "moved weapon to hotbar");
+        }
+    }
+    true
+}
+
+#[tracing::instrument(skip_all)]
+fn combat_tick(bot: Client, state: State, job: CombatJob) {
+    let current_tick = bot.ticks_connected();
+
+    // Timeout check
+    if current_tick.wrapping_sub(job.started_at_tick) > COMBAT_TIMEOUT_TICKS {
+        tracing::warn!(
+            elapsed_ticks = current_tick.wrapping_sub(job.started_at_tick),
+            "combat timeout exceeded, force-exiting to previous mode"
+        );
+        *state.mode.lock() = *job.previous_mode;
+        return;
+    }
+
+    match job.phase {
+        CombatPhase::Equipping => {
+            equip_combat_weapon(&bot);
+            // Move to scanning regardless of whether we found a weapon
+            *state.mode.lock() = BotMode::Combat(CombatJob {
+                phase: CombatPhase::Scanning,
+                ..job
+            });
+        }
+
+        CombatPhase::Scanning => {
+            match find_nearest_hostile(&bot, COMBAT_SCAN_RANGE) {
+                Some((entity, pos)) => {
+                    tracing::info!(?entity, ?pos, "hostile mob found, engaging");
+                    *state.mode.lock() = BotMode::Combat(CombatJob {
+                        phase: CombatPhase::Approaching(entity),
+                        ..job
+                    });
+                }
+                None => {
+                    // All clear — restore previous mode
+                    let health_now = bot.health();
+                    tracing::info!(
+                        health_at_entry = job.health_at_entry,
+                        health_now,
+                        resumed_mode = mode_name(&job.previous_mode),
+                        "combat complete, resuming previous task"
+                    );
+                    *state.mode.lock() = *job.previous_mode;
+                }
+            }
+        }
+
+        CombatPhase::Approaching(entity) => {
+            // Check if entity still alive
+            if bot.get_entity_component::<Position>(entity).is_none() {
+                tracing::debug!(?entity, "target entity gone, scanning for more");
+                *state.mode.lock() = BotMode::Combat(CombatJob {
+                    phase: CombatPhase::Scanning,
+                    ..job
+                });
+                return;
+            }
+
+            let mob_pos = **bot.get_entity_component::<Position>(entity).unwrap();
+            let dist = bot.eye_position().distance_to(mob_pos);
+
+            // Look at the mob
+            bot.look_at(mob_pos);
+
+            if dist <= MELEE_REACH {
+                *state.mode.lock() = BotMode::Combat(CombatJob {
+                    phase: CombatPhase::Attacking(entity),
+                    ..job
+                });
+            } else {
+                // Pathfind toward mob
+                let goal = RadiusGoal::new(mob_pos, MELEE_REACH as f32 - 0.5);
+                if !bot.is_calculating_path() {
+                    bot.start_goto_with_opts(
+                        goal,
+                        PathfinderOpts::new()
+                            .retry_on_no_path(false)
+                            .max_timeout(PathfinderTimeout::Time(Duration::from_secs(2))),
+                    );
+                }
+            }
+        }
+
+        CombatPhase::Attacking(entity) => {
+            // Check if entity still alive
+            if bot.get_entity_component::<Position>(entity).is_none() {
+                tracing::info!(?entity, "mob killed, scanning for remaining hostiles");
+                *state.mode.lock() = BotMode::Combat(CombatJob {
+                    phase: CombatPhase::Scanning,
+                    ..job
+                });
+                return;
+            }
+
+            let mob_pos = **bot.get_entity_component::<Position>(entity).unwrap();
+            let dist = bot.eye_position().distance_to(mob_pos);
+
+            // Look at the mob
+            bot.look_at(mob_pos);
+
+            if dist > MELEE_REACH {
+                // Mob moved away, go back to approaching
+                *state.mode.lock() = BotMode::Combat(CombatJob {
+                    phase: CombatPhase::Approaching(entity),
+                    ..job
+                });
+                return;
+            }
+
+            if !bot.has_attack_cooldown() {
+                bot.attack(entity);
+                tracing::debug!(?entity, "attacked mob");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -256,9 +444,8 @@ pub struct CombatJob {
     /// The bot's health when combat started (diagnostics).
     pub health_at_entry: f32,
     /// Tick count when combat started. Used for 30-second timeout (600 ticks).
-    /// Note: `bot.ticks_connected()` may return u32 or another integer type.
-    /// Use the same type as the return value, or cast with `as u32`.
-    pub started_at_tick: u32,
+    /// `bot.ticks_connected()` returns `u64`.
+    pub started_at_tick: u64,
 }
 
 pub fn strip_namespace(id: &str) -> &str {
@@ -489,6 +676,7 @@ pub fn needs_navigation_for_placement(
 
 /// Returns `true` if health decreased (indicating damage taken).
 /// Returns `false` if health is the same, increased, or previous was 0 (respawn).
+#[allow(dead_code)] // wired in Task 5
 fn detected_health_drop(previous: f32, current: f32) -> bool {
     previous > 0.0 && current < previous
 }
@@ -1496,7 +1684,7 @@ fn tick(bot: Client, state: State) {
         }
         BotMode::Collecting(job) => collect_tick(bot, state, job),
         BotMode::Building(job) => build_tick(bot, state, job),
-        BotMode::Combat(_) => { /* combat tick logic added in a later task */ }
+        BotMode::Combat(job) => combat_tick(bot, state, job),
     }
 }
 
