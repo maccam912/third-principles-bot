@@ -724,10 +724,25 @@ pub fn choose_placement_support_block<F>(
 where
     F: Fn(BlockPos) -> bool,
 {
+    let stance_manhattan =
+        (stance.x - target.x).abs() + (stance.z - target.z).abs();
+
+    // When the stance is far from the target (distance-2), only use the block
+    // directly below as support.  Looking at a same-level neighbour from 2+
+    // blocks away risks the raycast hitting an intermediate block (natural
+    // terrain between the bot and the support), placing the block in the wrong
+    // position.  The block-below's top face is always reachable because the
+    // ray travels through open airspace above the ground.
+    if stance_manhattan > 1 {
+        let below = BlockPos::new(target.x, target.y - 1, target.z);
+        return if is_passable(below) { None } else { Some(below) };
+    }
+
+    // ── Distance-1 stance (adjacent) ─────────────────────────────────────
     let mut candidates = Vec::with_capacity(5);
 
     if stance.y == target.y
-        && (stance.x - target.x).abs() + (stance.z - target.z).abs() == 1
+        && stance_manhattan == 1
         && !is_passable(stance)
     {
         candidates.push(stance);
@@ -1649,13 +1664,34 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
 
                 let expected_kind = BlockKind::from_str(strip_namespace(&block_entry.block)).ok();
 
+                tracing::trace!(
+                    block = %block_entry.block,
+                    x = target.x, y = target.y, z = target.z,
+                    current = ?current_kind,
+                    expected = ?expected_kind,
+                    attempt = *placement_attempts,
+                    "checking placement confirmation"
+                );
+
                 match (current_kind, expected_kind) {
                     (Some(actual), Some(expected)) if actual == expected => {
+                        tracing::debug!(
+                            block = %block_entry.block,
+                            x = target.x, y = target.y, z = target.z,
+                            "placement confirmed"
+                        );
                         *waiting_for_confirmation = false;
                         *placement_attempts = 0;
                         *next_index += 1;
                     }
                     (Some(actual), _) if actual != BlockKind::Air => {
+                        tracing::warn!(
+                            block = %block_entry.block,
+                            x = target.x, y = target.y, z = target.z,
+                            actual = ?actual,
+                            attempt = *placement_attempts,
+                            "wrong block at target, will mine"
+                        );
                         if *placement_attempts >= 3 {
                             tracing::error!(block = %block_entry.block, x = target.x, y = target.y, z = target.z, attempts = 3, "placement failed");
                             bot.stop_pathfinding();
@@ -1673,6 +1709,13 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                         *waiting_for_confirmation = false;
                     }
                     _ => {
+                        tracing::warn!(
+                            block = %block_entry.block,
+                            x = target.x, y = target.y, z = target.z,
+                            current = ?current_kind,
+                            attempt = *placement_attempts,
+                            "placement not confirmed (air or unknown)"
+                        );
                         if *placement_attempts >= 3 {
                             tracing::error!(block = %block_entry.block, x = target.x, y = target.y, z = target.z, attempts = 3, "placement failed");
                             bot.stop_pathfinding();
@@ -1708,9 +1751,22 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                     return;
                 };
 
-                let bot_block = BlockPos::from(bot.position());
-                let distance_to_stance = bot.position().distance_to(stance.center());
-                if needs_navigation_for_placement(bot_block, target, stance, distance_to_stance) {
+                let bot_pos = bot.position();
+                let bot_block = BlockPos::from(bot_pos);
+                let distance_to_stance = bot_pos.distance_to(stance.center());
+                let needs_nav = needs_navigation_for_placement(bot_block, target, stance, distance_to_stance);
+                tracing::debug!(
+                    block = %block_entry.block,
+                    target_x = target.x, target_y = target.y, target_z = target.z,
+                    stance_x = stance.x, stance_y = stance.y, stance_z = stance.z,
+                    bot_x = bot_block.x, bot_y = bot_block.y, bot_z = bot_block.z,
+                    bot_precise_x = %format!("{:.2}", bot_pos.x),
+                    bot_precise_z = %format!("{:.2}", bot_pos.z),
+                    distance_to_stance = %format!("{:.2}", distance_to_stance),
+                    needs_nav,
+                    "placement decision"
+                );
+                if needs_nav {
                     if bot_block == target {
                         tracing::warn!(
                             x = target.x,
@@ -1753,8 +1809,18 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                     return;
                 };
 
-                bot.look_at(placement_interaction_point(support, target));
-                tracing::debug!(block = %block_entry.block, x = target.x, y = target.y, z = target.z, attempt = *placement_attempts + 1, "placing block");
+                let interaction_pt = placement_interaction_point(support, target);
+                bot.look_at(interaction_pt);
+                tracing::debug!(
+                    block = %block_entry.block,
+                    x = target.x, y = target.y, z = target.z,
+                    support_x = support.x, support_y = support.y, support_z = support.z,
+                    look_x = %format!("{:.2}", interaction_pt.x),
+                    look_y = %format!("{:.2}", interaction_pt.y),
+                    look_z = %format!("{:.2}", interaction_pt.z),
+                    attempt = *placement_attempts + 1,
+                    "placing block"
+                );
                 bot.start_use_item();
                 *placement_attempts += 1;
                 *waiting_for_confirmation = true;
@@ -2132,6 +2198,25 @@ mod tests {
 
         let support = choose_placement_support_block(target, stance, |pos| !solids.contains(&pos));
         assert_eq!(support, Some(azalea::BlockPos::new(1, 64, 0)));
+    }
+
+    #[test]
+    fn placement_support_uses_block_below_when_stance_is_distance_2() {
+        let target = azalea::BlockPos::new(0, 64, 0);
+        let stance = azalea::BlockPos::new(2, 64, 0); // distance-2 stance
+        // Both the block below target AND a cardinal neighbour are solid.
+        // The function should pick block-below to avoid raycast obstruction.
+        let solids = solid_world(&[
+            azalea::BlockPos::new(0, 63, 0),  // below target
+            azalea::BlockPos::new(1, 64, 0),  // adjacent solid (between bot and target)
+        ]);
+
+        let support = choose_placement_support_block(target, stance, |pos| !solids.contains(&pos));
+        assert_eq!(
+            support,
+            Some(azalea::BlockPos::new(0, 63, 0)),
+            "distance-2 stance should only use block-below as support"
+        );
     }
 
     #[test]
