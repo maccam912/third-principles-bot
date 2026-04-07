@@ -69,19 +69,31 @@ fn execute_collect(ctx: &Ctx, count: Option<i32>) -> i32 {
                 .filter(|stack| target.counted_items.contains(&stack.kind()))
                 .map(|stack| stack.count().max(0) as u32)
                 .sum();
-            let mut job = CollectJob::new(target, request.count);
+            let mut job = CollectJob::new(
+                target,
+                request.count,
+                azalea::BlockPos::from(source.bot.position()),
+            );
             job.baseline_count = baseline_count;
 
+            tracing::info!(
+                sender = %source.sender,
+                target = %target_name,
+                count = request.count,
+                "collect command accepted"
+            );
             source.bot.stop_pathfinding();
             *source.state.mode.lock() = BotMode::Collecting(job);
             source.reply(format!("Collecting {} x{}.", target_name, request.count));
             1
         }
         Err(CollectError::UnknownTarget(target)) => {
+            tracing::warn!(sender = %source.sender, target = %target, "unknown collect target");
             source.reply(format!("I don't know how to collect {target}."));
             0
         }
         Err(CollectError::InvalidCount(count)) => {
+            tracing::warn!(sender = %source.sender, count = count, "invalid collect count");
             source.reply(format!("Count must be positive, got {count}."));
             0
         }

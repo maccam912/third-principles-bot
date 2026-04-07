@@ -2,16 +2,14 @@
 //!
 //! Send `!<botname> <command>` in chat to control the bot.
 
-mod commands;
-mod llm;
-mod state;
-
 use azalea::prelude::*;
-use state::State;
+use third_principles_bot::handle;
 
 #[tokio::main]
 async fn main() -> AppExit {
     dotenvy::dotenv().ok();
+    let _guard = third_principles_bot::init_tracing("main");
+
     let server_url = std::env::var("SERVER_URL").expect("SERVER_URL must be set in .env");
 
     let account = Account::offline("GoodBot");
@@ -21,8 +19,4 @@ async fn main() -> AppExit {
         .set_handler(handle)
         .start(account, server_url.as_str())
         .await
-}
-
-async fn handle(bot: Client, event: azalea::Event, state: State) -> eyre::Result<()> {
-    state::handle(bot, event, state).await
 }

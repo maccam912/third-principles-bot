@@ -10,6 +10,7 @@ use crate::{
 pub fn register(commands: &mut Dispatcher) {
     commands.register(literal("stop").executes(|ctx: &Ctx| {
         let source = ctx.source.lock();
+        tracing::info!(sender = %source.sender, "stop command received");
         *source.state.mode.lock() = BotMode::Idle;
         source.bot.stop_pathfinding();
         source.reply("Stopping.");

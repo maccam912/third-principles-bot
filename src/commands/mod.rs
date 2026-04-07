@@ -5,7 +5,7 @@ mod collect;
 mod come;
 mod stop;
 
-use azalea::{Client, brigadier::prelude::CommandDispatcher};
+use azalea::{brigadier::prelude::CommandDispatcher, Client};
 use parking_lot::Mutex;
 
 use crate::state::State;
@@ -49,13 +49,16 @@ pub fn build() -> Dispatcher {
 }
 
 /// Dispatch a command string, reporting errors in chat.
+#[tracing::instrument(skip_all, fields(command = %command))]
 pub fn dispatch(dispatcher: &Dispatcher, command: String, source: CommandSource) {
     let bot = source.bot.clone();
     match dispatcher.execute(command, Mutex::new(source)) {
         Ok(_) => {}
         Err(err) => {
-            eprintln!("[cmd error] {err:?}");
+            tracing::warn!(error = ?err, "command dispatch failed");
             bot.chat(format!("Unknown command ({err:?})").as_str());
         }
     }
 }
+
+pub use build::queue_build;

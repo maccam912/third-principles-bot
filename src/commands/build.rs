@@ -5,11 +5,11 @@ use std::sync::Arc;
 use azalea::brigadier::prelude::*;
 use azalea::pathfinder::PathfinderClientExt;
 use azalea::registry::builtin::BlockKind;
-use azalea::{BlockPos, block::BlockStates};
+use azalea::{block::BlockStates, BlockPos};
 use parking_lot::Mutex;
 
 use crate::commands::{Ctx, Dispatcher};
-use crate::state::{BotMode, BuildJob, BuildPhase, block_distance_sq};
+use crate::state::{block_distance_sq, BotMode, BuildJob, BuildPhase};
 
 pub fn register(commands: &mut Dispatcher) {
     commands.register(
@@ -23,14 +23,21 @@ fn execute_build(ctx: &Ctx) -> i32 {
     let source = ctx.source.lock();
     let description = get_string(ctx, "description").expect("build description argument missing");
 
-    let bot = &source.bot;
-    let origin = BlockPos::from(bot.position());
+    queue_build(&source.bot, &source.state, description.clone());
 
+    source.reply(format!(
+        "Building: {description}. Scanning nearby chests..."
+    ));
+    1
+}
+
+pub fn queue_build(bot: &azalea::Client, state: &crate::state::State, description: String) {
+    let origin = BlockPos::from(bot.position());
     let chests = find_nearby_chests(bot, origin, 15);
 
     bot.stop_pathfinding();
-    *source.state.mode.lock() = BotMode::Building(BuildJob {
-        description: description.clone(),
+    *state.mode.lock() = BotMode::Building(BuildJob {
+        description,
         origin,
         phase: BuildPhase::ScanningChests {
             chests,
@@ -38,11 +45,6 @@ fn execute_build(ctx: &Ctx) -> i32 {
             spawned: false,
         },
     });
-
-    source.reply(format!(
-        "Building: {description}. Scanning nearby chests..."
-    ));
-    1
 }
 
 fn find_nearby_chests(bot: &azalea::Client, origin: BlockPos, radius: i64) -> Vec<BlockPos> {

@@ -5,7 +5,7 @@ use std::str::FromStr;
 use std::{sync::Arc, time::Duration};
 
 use azalea::{
-    BlockPos, Client,
+    BlockPos, Client, Vec3,
     ecs::{
         prelude::{Component, Entity},
         query::With,
@@ -45,6 +45,15 @@ pub enum BotMode {
     Building(BuildJob),
 }
 
+fn mode_name(mode: &BotMode) -> &'static str {
+    match mode {
+        BotMode::Idle => "idle",
+        BotMode::Following(_) => "following",
+        BotMode::Collecting(_) => "collecting",
+        BotMode::Building(_) => "building",
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectTarget {
     pub name: String,
@@ -71,6 +80,7 @@ pub enum ToolEquipPlan {
     },
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ToolSearchOutcome {
     AlreadySelected,
@@ -164,18 +174,22 @@ pub struct CollectJob {
     pub baseline_count: u32,
     pub phase: CollectPhase,
     pub active_block_target: Option<BlockPos>,
+    pub active_stance_target: Option<BlockPos>,
     pub last_mined_block: Option<BlockPos>,
+    pub return_anchor: BlockPos,
 }
 
 impl CollectJob {
-    pub fn new(target: CollectTarget, requested_count: u32) -> Self {
+    pub fn new(target: CollectTarget, requested_count: u32, return_anchor: BlockPos) -> Self {
         Self {
             target,
             requested_count,
             baseline_count: 0,
             phase: CollectPhase::Searching,
             active_block_target: None,
+            active_stance_target: None,
             last_mined_block: None,
+            return_anchor,
         }
     }
 }
@@ -293,6 +307,151 @@ pub fn block_distance_sq(a: BlockPos, b: BlockPos) -> i64 {
     dx * dx + dy * dy + dz * dz
 }
 
+fn is_passable_block(kind: Option<BlockKind>) -> bool {
+    matches!(
+        kind,
+        None | Some(BlockKind::Air | BlockKind::CaveAir | BlockKind::VoidAir)
+    )
+}
+
+fn can_occupy_block<F>(pos: BlockPos, is_passable: &F) -> bool
+where
+    F: Fn(BlockPos) -> bool,
+{
+    is_passable(pos)
+        && is_passable(BlockPos::new(pos.x, pos.y + 1, pos.z))
+        && !is_passable(BlockPos::new(pos.x, pos.y - 1, pos.z))
+}
+
+fn has_escape_step<F>(stance: BlockPos, target: BlockPos, is_passable: &F) -> bool
+where
+    F: Fn(BlockPos) -> bool,
+{
+    const CARDINAL_DIRS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+
+    CARDINAL_DIRS.iter().any(|(dx, dz)| {
+        let next = BlockPos::new(stance.x + dx, stance.y, stance.z + dz);
+        next != target && can_occupy_block(next, is_passable)
+    })
+}
+
+pub fn choose_safe_action_stance<F>(
+    target: BlockPos,
+    anchor: BlockPos,
+    y_offsets: &[i32],
+    is_passable: F,
+) -> Option<BlockPos>
+where
+    F: Fn(BlockPos) -> bool,
+{
+    const CARDINAL_DIRS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+
+    let min_safe_y = anchor.y - 1;
+
+    y_offsets
+        .iter()
+        .flat_map(|y_offset| {
+            CARDINAL_DIRS.iter().map(move |(dx, dz)| {
+                BlockPos::new(target.x + dx, target.y + y_offset, target.z + dz)
+            })
+        })
+        .filter(|candidate| candidate.y >= min_safe_y)
+        .filter(|candidate| can_occupy_block(*candidate, &is_passable))
+        .filter(|candidate| has_escape_step(*candidate, target, &is_passable))
+        .min_by_key(|candidate| {
+            (
+                block_distance_sq(*candidate, anchor),
+                block_distance_sq(*candidate, target),
+            )
+        })
+}
+
+pub fn choose_safe_collect_target<F>(
+    candidates: &[BlockPos],
+    bot_pos: BlockPos,
+    anchor: BlockPos,
+    last_mined: Option<BlockPos>,
+    prefer_near_last_mined: bool,
+    safe_stance_for: F,
+) -> Option<(BlockPos, BlockPos)>
+where
+    F: Fn(BlockPos) -> Option<BlockPos>,
+{
+    let mut ordered = Vec::with_capacity(candidates.len());
+
+    if prefer_near_last_mined && let Some(last_mined) = last_mined {
+        let mut nearby: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| block_distance_sq(*candidate, last_mined) <= 9)
+            .collect();
+        nearby.sort_by_key(|candidate| block_distance_sq(*candidate, last_mined));
+        ordered.extend(nearby);
+    }
+
+    let mut remaining: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| !ordered.contains(candidate))
+        .collect();
+    remaining.sort_by_key(|candidate| {
+        (
+            block_distance_sq(*candidate, bot_pos),
+            block_distance_sq(*candidate, anchor),
+        )
+    });
+    ordered.extend(remaining);
+
+    ordered
+        .into_iter()
+        .find_map(|candidate| safe_stance_for(candidate).map(|stance| (candidate, stance)))
+}
+
+pub fn choose_placement_support_block<F>(
+    target: BlockPos,
+    stance: BlockPos,
+    is_passable: F,
+) -> Option<BlockPos>
+where
+    F: Fn(BlockPos) -> bool,
+{
+    let mut candidates = Vec::with_capacity(5);
+
+    if stance.y == target.y
+        && (stance.x - target.x).abs() + (stance.z - target.z).abs() == 1
+        && !is_passable(stance)
+    {
+        candidates.push(stance);
+    }
+
+    let below = BlockPos::new(target.x, target.y - 1, target.z);
+    if !is_passable(below) {
+        candidates.push(below);
+    }
+
+    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+        let candidate = BlockPos::new(target.x + dx, target.y, target.z + dz);
+        if candidate != stance && !is_passable(candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates
+        .into_iter()
+        .min_by_key(|candidate| block_distance_sq(*candidate, stance))
+}
+
+fn placement_interaction_point(support: BlockPos, target: BlockPos) -> Vec3 {
+    let support_center = support.center();
+    let target_center = target.center();
+    Vec3::new(
+        (support_center.x + target_center.x) / 2.0,
+        (support_center.y + target_center.y) / 2.0,
+        (support_center.z + target_center.z) / 2.0,
+    )
+}
+
+#[cfg(test)]
 pub fn choose_next_collect_block(
     candidates: &[BlockPos],
     bot_pos: BlockPos,
@@ -384,6 +543,7 @@ fn tool_matches(item: ItemKind, preferred_tool: PreferredTool) -> bool {
     )
 }
 
+#[cfg(test)]
 fn preferred_tool_name(preferred_tool: PreferredTool) -> &'static str {
     match preferred_tool {
         PreferredTool::Axe => "axe",
@@ -395,6 +555,7 @@ fn item_kind_name(item: ItemKind) -> String {
     item.to_string().trim_start_matches("minecraft:").to_owned()
 }
 
+#[cfg(test)]
 fn log_collect_tool_search_attempt(target_name: &str, preferred_tool: PreferredTool) -> String {
     format!(
         "[collect] {target_name} prefers {}, checking inventory",
@@ -402,6 +563,7 @@ fn log_collect_tool_search_attempt(target_name: &str, preferred_tool: PreferredT
     )
 }
 
+#[cfg(test)]
 fn log_collect_tool_search_outcome(
     target_name: &str,
     preferred_tool: PreferredTool,
@@ -471,14 +633,12 @@ pub fn plan_tool_equip(
     None
 }
 
+#[tracing::instrument(skip_all, fields(target_name = %target.name))]
 fn equip_collect_tool(bot: &Client, target: &CollectTarget) -> bool {
     let Some(preferred_tool) = preferred_tool_for_collect_target(target) else {
         return false;
     };
-    eprintln!(
-        "{}",
-        log_collect_tool_search_attempt(&target.name, preferred_tool)
-    );
+    tracing::debug!(target_name = %target.name, preferred_tool = ?preferred_tool, "checking inventory for preferred tool");
 
     let menu = bot.menu();
     let slots = menu
@@ -492,14 +652,7 @@ fn equip_collect_tool(bot: &Client, target: &CollectTarget) -> bool {
     if let Some(item) = slots.get(selected_hotbar_slot).copied().flatten()
         && tool_matches(item, preferred_tool)
     {
-        eprintln!(
-            "{}",
-            log_collect_tool_search_outcome(
-                &target.name,
-                preferred_tool,
-                ToolSearchOutcome::AlreadySelected
-            )
-        );
+        tracing::debug!(target_name = %target.name, preferred_tool = ?preferred_tool, "already holding preferred tool");
         return false;
     }
     let Some(plan) = plan_tool_equip(
@@ -508,14 +661,7 @@ fn equip_collect_tool(bot: &Client, target: &CollectTarget) -> bool {
         selected_hotbar_index,
         preferred_tool,
     ) else {
-        eprintln!(
-            "{}",
-            log_collect_tool_search_outcome(
-                &target.name,
-                preferred_tool,
-                ToolSearchOutcome::Missing
-            )
-        );
+        tracing::debug!(target_name = %target.name, preferred_tool = ?preferred_tool, "no preferred tool found, mining bare-handed");
         return false;
     };
 
@@ -528,14 +674,7 @@ fn equip_collect_tool(bot: &Client, target: &CollectTarget) -> bool {
                 .flatten()
                 .expect("hotbar plan should point at a present tool");
             bot.set_selected_hotbar_slot(hotbar_index);
-            eprintln!(
-                "{}",
-                log_collect_tool_search_outcome(
-                    &target.name,
-                    preferred_tool,
-                    ToolSearchOutcome::FoundInHotbar(item)
-                )
-            );
+            tracing::debug!(target_name = %target.name, preferred_tool = ?preferred_tool, item = %item_kind_name(item), "equipped tool from hotbar");
             true
         }
         ToolEquipPlan::MoveToSelectedHotbar {
@@ -555,14 +694,7 @@ fn equip_collect_tool(bot: &Client, target: &CollectTarget) -> bool {
             inventory.left_click(hotbar_slot);
             inventory.left_click(source_slot);
             bot.set_selected_hotbar_slot(hotbar_index);
-            eprintln!(
-                "{}",
-                log_collect_tool_search_outcome(
-                    &target.name,
-                    preferred_tool,
-                    ToolSearchOutcome::FoundInInventory(item)
-                )
-            );
+            tracing::debug!(target_name = %target.name, preferred_tool = ?preferred_tool, item = %item_kind_name(item), "moved tool from inventory to hotbar");
             true
         }
     }
@@ -607,6 +739,7 @@ fn plan_item_equip(
 
 /// Equip `target` item to active hotbar slot. Returns `true` if a swap was initiated
 /// (caller should return early to let the swap take effect next tick).
+#[tracing::instrument(skip_all, fields(target = ?target))]
 fn equip_item(bot: &Client, target: ItemKind) -> bool {
     let menu = bot.menu();
     let slots: Vec<Option<ItemKind>> = menu
@@ -664,6 +797,7 @@ fn normalize_collect_candidates(
     lowest_by_column.into_values().collect()
 }
 
+#[tracing::instrument(skip_all, fields(target_name = %target.name))]
 fn find_collect_candidates(bot: &Client, target: &CollectTarget) -> Vec<BlockPos> {
     let world = bot.world();
     let world = world.read();
@@ -675,6 +809,20 @@ fn find_collect_candidates(bot: &Client, target: &CollectTarget) -> Vec<BlockPos
     }
 
     normalize_collect_candidates(&candidates, target.prefer_near_last_mined)
+}
+
+fn choose_world_safe_action_stance(
+    bot: &Client,
+    target: BlockPos,
+    anchor: BlockPos,
+    y_offsets: &[i32],
+) -> Option<BlockPos> {
+    let world = bot.world();
+    let world = world.read();
+
+    choose_safe_action_stance(target, anchor, y_offsets, |pos| {
+        is_passable_block(world.get_block_state(pos).map(BlockKind::from))
+    })
 }
 
 fn block_is_collect_target(bot: &Client, target: &CollectTarget, pos: BlockPos) -> bool {
@@ -710,11 +858,13 @@ pub enum CollectTickOutcome {
     },
 }
 
+#[tracing::instrument(skip_all, fields(target_name = %job.target.name, phase = ?job.phase))]
 fn collect_tick_inner(bot: &Client, mut job: CollectJob) -> CollectTickOutcome {
     let current_count = current_inventory_count(bot, &job.target);
     let collected = current_count.saturating_sub(job.baseline_count);
 
     if collected >= job.requested_count {
+        tracing::info!(collected, requested = job.requested_count, "collected count reached target");
         bot.stop_pathfinding();
         return CollectTickOutcome::Done {
             collected,
@@ -725,14 +875,16 @@ fn collect_tick_inner(bot: &Client, mut job: CollectJob) -> CollectTickOutcome {
     match job.phase {
         CollectPhase::Searching => {
             let candidates = find_collect_candidates(bot, &job.target);
-            let next = choose_next_collect_block(
+            let next = choose_safe_collect_target(
                 &candidates,
                 BlockPos::from(bot.position()),
+                job.return_anchor,
                 job.last_mined_block,
                 job.target.prefer_near_last_mined,
+                |target| choose_world_safe_action_stance(bot, target, job.return_anchor, &[1, 0]),
             );
 
-            let Some(next) = next else {
+            let Some((next, stance)) = next else {
                 bot.stop_pathfinding();
                 return CollectTickOutcome::ExhaustedTargets {
                     collected,
@@ -742,26 +894,44 @@ fn collect_tick_inner(bot: &Client, mut job: CollectJob) -> CollectTickOutcome {
             };
 
             job.active_block_target = Some(next);
+            job.active_stance_target = Some(stance);
+            tracing::info!(from = "Searching", to = "MovingToBlock", target_x = next.x, target_y = next.y, target_z = next.z, "collect phase transition");
             job.phase = CollectPhase::MovingToBlock(next);
         }
         CollectPhase::MovingToBlock(target_pos) => {
+            let stance_pos = choose_world_safe_action_stance(bot, target_pos, job.return_anchor, &[1, 0]);
+
             if !block_is_collect_target(bot, &job.target, target_pos) {
                 job.active_block_target = None;
+                job.active_stance_target = None;
+                tracing::info!(from = "MovingToBlock", to = "Searching", "collect phase transition");
                 job.phase = CollectPhase::Searching;
-            } else if bot.position().distance_to(target_pos.center()) <= 4.5 {
-                bot.stop_pathfinding();
-                job.phase = CollectPhase::Mining(target_pos);
-            } else if !bot.is_calculating_path() {
-                bot.start_goto_with_opts(
-                    RadiusGoal::new(target_pos.center(), 3.0),
-                    collect_pathfinder_opts(),
-                );
+            } else if let Some(stance_pos) = stance_pos {
+                if bot.position().distance_to(stance_pos.center()) <= 1.5 {
+                    bot.stop_pathfinding();
+                    job.active_stance_target = Some(stance_pos);
+                    tracing::info!(from = "MovingToBlock", to = "Mining", "collect phase transition");
+                    job.phase = CollectPhase::Mining(target_pos);
+                } else if !bot.is_calculating_path() {
+                    job.active_stance_target = Some(stance_pos);
+                    bot.start_goto_with_opts(
+                        RadiusGoal::new(stance_pos.center(), 1.0),
+                        collect_pathfinder_opts(),
+                    );
+                }
+            } else {
+                job.active_block_target = None;
+                job.active_stance_target = None;
+                tracing::info!(from = "MovingToBlock", to = "Searching", "collect phase transition");
+                job.phase = CollectPhase::Searching;
             }
         }
         CollectPhase::Mining(target_pos) => {
             if !block_is_collect_target(bot, &job.target, target_pos) {
                 job.last_mined_block = Some(target_pos);
                 job.active_block_target = None;
+                job.active_stance_target = None;
+                tracing::info!(from = "Mining", to = "Looting", "collect phase transition");
                 job.phase = CollectPhase::Looting;
             } else {
                 if equip_collect_tool(bot, &job.target) {
@@ -778,6 +948,7 @@ fn collect_tick_inner(bot: &Client, mut job: CollectJob) -> CollectTickOutcome {
                 let drop_pos = drop.position();
                 if bot.position().distance_to(drop_pos) <= 1.5 {
                     bot.stop_pathfinding();
+                    tracing::info!(from = "Looting", to = "Searching", "collect phase transition");
                     job.phase = CollectPhase::Searching;
                 } else if !bot.is_calculating_path() {
                     bot.start_goto_with_opts(
@@ -786,6 +957,7 @@ fn collect_tick_inner(bot: &Client, mut job: CollectJob) -> CollectTickOutcome {
                     );
                 }
             } else {
+                tracing::info!(from = "Looting", to = "Searching", "collect phase transition");
                 job.phase = CollectPhase::Searching;
             }
         }
@@ -794,12 +966,14 @@ fn collect_tick_inner(bot: &Client, mut job: CollectJob) -> CollectTickOutcome {
     CollectTickOutcome::Continue(job)
 }
 
+#[tracing::instrument(skip_all, fields(target_name = %job.target.name))]
 fn collect_tick(bot: Client, state: State, job: CollectJob) {
     match collect_tick_inner(&bot, job) {
         CollectTickOutcome::Continue(job) => {
             *state.mode.lock() = BotMode::Collecting(job);
         }
         CollectTickOutcome::Done { collected, name } => {
+            tracing::info!(collected, name = %name, "collect done");
             *state.mode.lock() = BotMode::Idle;
             bot.chat(format!("Collected {} {}.", collected, name));
         }
@@ -808,6 +982,7 @@ fn collect_tick(bot: Client, state: State, job: CollectJob) {
             requested,
             name,
         } => {
+            tracing::info!(collected, requested, name = %name, "collect exhausted targets");
             *state.mode.lock() = BotMode::Idle;
             bot.chat(format!(
                 "I only collected {}/{} {} before running out of targets.",
@@ -817,6 +992,7 @@ fn collect_tick(bot: Client, state: State, job: CollectJob) {
     }
 }
 
+#[tracing::instrument(skip_all, fields(description = %job.description))]
 fn build_tick(bot: Client, state: State, mut job: BuildJob) {
     match &mut job.phase {
         BuildPhase::ScanningChests {
@@ -834,11 +1010,11 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                         let goal = RadiusGoal::new(chest_pos.center(), 3.0);
                         bot_clone.goto(goal).await;
                         let Some(container) = bot_clone.open_container_at(chest_pos).await else {
-                            eprintln!("[build] failed to open chest at {chest_pos:?}");
+                            tracing::warn!(chest = ?chest_pos, "failed to open chest");
                             continue;
                         };
                         let Some(contents) = container.contents() else {
-                            eprintln!("[build] lost chest contents at {chest_pos:?}");
+                            tracing::warn!(chest = ?chest_pos, "lost chest contents");
                             continue;
                         };
                         for slot in contents {
@@ -876,6 +1052,7 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                     };
                     *combined.entry(id).or_insert(0) += slot.count().max(0) as u32;
                 }
+                tracing::info!(from = "ScanningChests", to = "WaitingForLlm", "build phase transition");
                 job.phase = BuildPhase::WaitingForLlm {
                     inventory: combined,
                     result: Arc::new(Mutex::new(None)),
@@ -889,11 +1066,7 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
             spawned,
         } => {
             if !*spawned {
-                eprintln!(
-                    "[build] spawning LLM request for '{}' with {} inventory item types",
-                    job.description,
-                    inventory.len()
-                );
+                tracing::info!(description = %job.description, inventory_types = inventory.len(), "spawning LLM request");
                 let result = Arc::clone(result);
                 let description = job.description.clone();
                 let inventory = inventory.clone();
@@ -906,18 +1079,15 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
 
             let llm_result = result.lock().clone();
             if let Some(outcome) = llm_result {
-                eprintln!("[build] LLM request completed for '{}'", job.description);
+                tracing::info!(description = %job.description, "LLM request completed");
                 match outcome {
                     Ok(mut structure) => {
-                        eprintln!(
-                            "[build] LLM returned structure blocks={} materials={}",
-                            structure.blocks.len(),
-                            structure.materials.len()
-                        );
+                        tracing::info!(blocks = structure.blocks.len(), materials = structure.materials.len(), "LLM returned structure");
                         let missing = compute_missing(&structure, &*inventory);
                         if missing.is_empty() {
-                            eprintln!("[build] all required materials already available");
+                            tracing::info!("all required materials already available");
                             sort_blocks_by_y(&mut structure.blocks);
+                            tracing::info!(from = "WaitingForLlm", to = "PlacingBlocks", "build phase transition");
                             job.phase = BuildPhase::PlacingBlocks {
                                 structure,
                                 next_index: 0,
@@ -925,10 +1095,8 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                                 waiting_for_confirmation: false,
                             };
                         } else {
-                            eprintln!(
-                                "[build] missing {} material types, switching to collection",
-                                missing.len()
-                            );
+                            tracing::info!(missing_types = missing.len(), "missing materials, switching to collection");
+                            tracing::info!(from = "WaitingForLlm", to = "CollectingResources", "build phase transition");
                             job.phase = BuildPhase::CollectingResources {
                                 structure,
                                 missing,
@@ -937,7 +1105,7 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[build] LLM request failed: {e}");
+                        tracing::error!(error = %e, "LLM request failed");
                         bot.stop_pathfinding();
                         *state.mode.lock() = BotMode::Idle;
                         bot.chat(format!("Build failed: LLM error — {e}."));
@@ -968,12 +1136,12 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                             .filter(|s| s.kind() == ik)
                             .map(|s| s.count().max(0) as u32)
                             .sum();
-                        let mut cjob = CollectJob::new(target, count);
+                        let mut cjob = CollectJob::new(target, count, job.origin);
                         cjob.baseline_count = baseline;
                         *active_job = Some(cjob);
                     }
                     _ => {
-                        eprintln!("[build] can't collect unknown item {item_id}, skipping");
+                        tracing::warn!(item_id = %item_id, "can't collect unknown item, skipping");
                     }
                 }
             }
@@ -995,6 +1163,7 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
             if missing.is_empty() && active_job.is_none() {
                 let mut sorted_structure = structure.clone();
                 sort_blocks_by_y(&mut sorted_structure.blocks);
+                tracing::info!(from = "CollectingResources", to = "PlacingBlocks", "build phase transition");
                 job.phase = BuildPhase::PlacingBlocks {
                     structure: sorted_structure,
                     next_index: 0,
@@ -1010,6 +1179,7 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
             waiting_for_confirmation,
         } => {
             if *next_index >= structure.blocks.len() {
+                tracing::info!(description = %job.description, "finished building");
                 bot.stop_pathfinding();
                 *state.mode.lock() = BotMode::Idle;
                 bot.chat(format!("Finished building {}.", job.description));
@@ -1037,6 +1207,7 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                     }
                     (Some(actual), _) if actual != BlockKind::Air => {
                         if *placement_attempts >= 3 {
+                            tracing::error!(block = %block_entry.block, x = target.x, y = target.y, z = target.z, attempts = 3, "placement failed");
                             bot.stop_pathfinding();
                             *state.mode.lock() = BotMode::Idle;
                             bot.chat(format!(
@@ -1053,6 +1224,7 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                     }
                     _ => {
                         if *placement_attempts >= 3 {
+                            tracing::error!(block = %block_entry.block, x = target.x, y = target.y, z = target.z, attempts = 3, "placement failed");
                             bot.stop_pathfinding();
                             *state.mode.lock() = BotMode::Idle;
                             bot.chat(format!(
@@ -1073,10 +1245,22 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                     return;
                 }
 
-                if bot.position().distance_to(target.center()) > 4.5 {
+                let Some(stance) = choose_world_safe_action_stance(&bot, target, job.origin, &[0, -1])
+                else {
+                    tracing::error!(block = %block_entry.block, x = target.x, y = target.y, z = target.z, "no safe placement stance");
+                    bot.stop_pathfinding();
+                    *state.mode.lock() = BotMode::Idle;
+                    bot.chat(format!(
+                        "Build failed: no safe placement stance for {} at {},{},{}.",
+                        block_entry.block, target.x, target.y, target.z
+                    ));
+                    return;
+                };
+
+                if bot.position().distance_to(stance.center()) > 1.5 {
                     if !bot.is_calculating_path() {
                         bot.start_goto_with_opts(
-                            RadiusGoal::new(target.center(), 3.0),
+                            RadiusGoal::new(stance.center(), 1.0),
                             collect_pathfinder_opts(),
                         );
                     }
@@ -1084,16 +1268,24 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                     return;
                 }
 
-                bot.look_at(target.center());
-                // Place the block by right-clicking the top face of the block below.
-                // This is the standard Minecraft way to place a block on a surface.
-                // TODO: verify if azalea exposes a higher-level place_block API.
-                let below = BlockPos {
-                    x: target.x,
-                    y: target.y - 1,
-                    z: target.z,
+                let world = bot.world();
+                let world = world.read();
+                let Some(support) = choose_placement_support_block(target, stance, |pos| {
+                    is_passable_block(world.get_block_state(pos).map(BlockKind::from))
+                }) else {
+                    tracing::error!(block = %block_entry.block, x = target.x, y = target.y, z = target.z, stance_x = stance.x, stance_y = stance.y, stance_z = stance.z, "no support block available");
+                    bot.stop_pathfinding();
+                    *state.mode.lock() = BotMode::Idle;
+                    bot.chat(format!(
+                        "Build failed: no support block available for {} at {},{},{}.",
+                        block_entry.block, target.x, target.y, target.z
+                    ));
+                    return;
                 };
-                bot.block_interact(below);
+
+                bot.look_at(placement_interaction_point(support, target));
+                tracing::debug!(block = %block_entry.block, x = target.x, y = target.y, z = target.z, attempt = *placement_attempts + 1, "placing block");
+                bot.start_use_item();
                 *placement_attempts += 1;
                 *waiting_for_confirmation = true;
             }
@@ -1127,6 +1319,7 @@ impl Default for State {
 // Top-level event handler
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(skip_all)]
 pub async fn handle(bot: Client, event: azalea::Event, state: State) -> eyre::Result<()> {
     match event {
         // ------------------------------------------------------------------
@@ -1180,8 +1373,10 @@ pub async fn handle(bot: Client, event: azalea::Event, state: State) -> eyre::Re
 // Tick logic
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(skip_all)]
 fn tick(bot: Client, state: State) {
     let mode = state.mode.lock().clone();
+    tracing::trace!(mode = mode_name(&mode), tick = bot.ticks_connected(), "tick");
     match mode {
         BotMode::Idle => {}
         BotMode::Following(entity) => {
@@ -1190,7 +1385,7 @@ fn tick(bot: Client, state: State) {
             // Position derefs to Vec3
             else {
                 // Entity is no longer in render distance — return to idle.
-                eprintln!("[bot] target out of render distance, going idle");
+                tracing::warn!("target out of render distance, going idle");
                 *state.mode.lock() = BotMode::Idle;
                 return;
             };
@@ -1221,11 +1416,13 @@ mod tests {
 
     use super::{
         CollectJob, CollectPhase, CollectProgress, CollectTarget, PreferredTool, ToolEquipPlan,
-        ToolSearchOutcome, choose_next_collect_block, collect_progress_from_counts,
+        ToolSearchOutcome, choose_next_collect_block, choose_placement_support_block,
+        choose_safe_action_stance, choose_safe_collect_target, collect_progress_from_counts,
         compute_missing, log_collect_tool_search_attempt, log_collect_tool_search_outcome,
         next_collect_phase_after_search, normalize_collect_candidates, plan_tool_equip,
         preferred_tool_for_collect_target, sort_blocks_by_y, strip_namespace,
     };
+    use std::collections::HashSet;
 
     fn slot_items(items: &[Option<ItemKind>]) -> Vec<Option<ItemKind>> {
         items.to_vec()
@@ -1237,7 +1434,7 @@ mod tests {
 
     #[test]
     fn collect_job_tracks_active_block_target() {
-        let job = CollectJob::new(CollectTarget::wood(), 3);
+        let job = CollectJob::new(CollectTarget::wood(), 3, azalea::BlockPos::new(0, 64, 0));
         assert_eq!(job.active_block_target, None);
     }
 
@@ -1321,6 +1518,112 @@ mod tests {
     fn search_returns_none_when_no_loaded_targets_exist() {
         let chosen = choose_next_collect_block(&[], azalea::BlockPos::new(0, 64, 0), None, false);
         assert_eq!(chosen, None);
+    }
+
+    fn solid_world(blocks: &[azalea::BlockPos]) -> HashSet<azalea::BlockPos> {
+        blocks.iter().copied().collect()
+    }
+
+    #[test]
+    fn safe_action_stance_prefers_neighbor_with_escape_toward_anchor() {
+        let target = azalea::BlockPos::new(0, 64, 0);
+        let anchor = azalea::BlockPos::new(5, 64, 0);
+        let solids = solid_world(&[
+            azalea::BlockPos::new(-1, 63, 0),
+            azalea::BlockPos::new(0, 63, 1),
+            azalea::BlockPos::new(1, 63, 0),
+            azalea::BlockPos::new(2, 63, 0),
+        ]);
+
+        let stance = choose_safe_action_stance(target, anchor, &[0], |pos| !solids.contains(&pos));
+        assert_eq!(stance, Some(azalea::BlockPos::new(1, 64, 0)));
+    }
+
+    #[test]
+    fn safe_action_stance_rejects_single_cell_pit() {
+        let target = azalea::BlockPos::new(0, 62, 0);
+        let anchor = azalea::BlockPos::new(0, 64, 4);
+        let solids = solid_world(&[
+            azalea::BlockPos::new(1, 61, 0),
+            azalea::BlockPos::new(2, 62, 0),
+            azalea::BlockPos::new(1, 62, 1),
+            azalea::BlockPos::new(1, 62, -1),
+            azalea::BlockPos::new(1, 63, 0),
+            azalea::BlockPos::new(0, 63, 0),
+        ]);
+
+        let stance = choose_safe_action_stance(target, anchor, &[0], |pos| !solids.contains(&pos));
+        assert_eq!(stance, None);
+    }
+
+    #[test]
+    fn safe_collect_target_skips_nearest_candidate_without_safe_stance() {
+        let bot_pos = azalea::BlockPos::new(0, 64, 0);
+        let anchor = azalea::BlockPos::new(0, 64, 0);
+        let risky = azalea::BlockPos::new(1, 62, 0);
+        let safe = azalea::BlockPos::new(4, 64, 0);
+        let candidates = vec![risky, safe];
+        let solids = solid_world(&[
+            azalea::BlockPos::new(2, 61, 0),
+            azalea::BlockPos::new(3, 62, 0),
+            azalea::BlockPos::new(2, 62, 1),
+            azalea::BlockPos::new(2, 62, -1),
+            azalea::BlockPos::new(2, 63, 0),
+            azalea::BlockPos::new(1, 63, 0),
+            azalea::BlockPos::new(3, 63, 0),
+            azalea::BlockPos::new(4, 63, 1),
+            azalea::BlockPos::new(5, 63, 0),
+            azalea::BlockPos::new(6, 63, 0),
+        ]);
+
+        let chosen = choose_safe_collect_target(
+            &candidates,
+            bot_pos,
+            anchor,
+            None,
+            false,
+            |target| choose_safe_action_stance(target, anchor, &[0], |pos| !solids.contains(&pos)),
+        );
+
+        assert_eq!(chosen, Some((safe, azalea::BlockPos::new(3, 64, 0))));
+    }
+
+    #[test]
+    fn placement_stance_uses_supported_adjacent_block_below_target() {
+        let target = azalea::BlockPos::new(0, 65, 0);
+        let anchor = azalea::BlockPos::new(3, 64, 0);
+        let solids = solid_world(&[
+            azalea::BlockPos::new(1, 63, 0),
+            azalea::BlockPos::new(2, 63, 0),
+        ]);
+
+        let stance =
+            choose_safe_action_stance(target, anchor, &[0, -1], |pos| !solids.contains(&pos));
+        assert_eq!(stance, Some(azalea::BlockPos::new(1, 64, 0)));
+    }
+
+    #[test]
+    fn placement_stance_allows_build_origin_when_exit_moves_away_from_anchor() {
+        let target = azalea::BlockPos::new(0, 64, 0);
+        let anchor = azalea::BlockPos::new(0, 64, 0);
+        let solids = solid_world(&[
+            azalea::BlockPos::new(1, 63, 0),
+            azalea::BlockPos::new(2, 63, 0),
+        ]);
+
+        let stance =
+            choose_safe_action_stance(target, anchor, &[0, -1], |pos| !solids.contains(&pos));
+        assert_eq!(stance, Some(azalea::BlockPos::new(1, 64, 0)));
+    }
+
+    #[test]
+    fn placement_support_prefers_adjacent_solid_when_target_has_no_block_below() {
+        let target = azalea::BlockPos::new(0, 64, 0);
+        let stance = azalea::BlockPos::new(1, 64, 0);
+        let solids = solid_world(&[azalea::BlockPos::new(1, 63, 0), azalea::BlockPos::new(1, 64, 0)]);
+
+        let support = choose_placement_support_block(target, stance, |pos| !solids.contains(&pos));
+        assert_eq!(support, Some(azalea::BlockPos::new(1, 64, 0)));
     }
 
     #[test]

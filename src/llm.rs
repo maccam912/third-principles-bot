@@ -170,6 +170,7 @@ fn find_sse_event_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
 // LLM response parsers
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(skip_all)]
 fn parse_tuple_format(content: &str) -> Result<Structure, String> {
     let fmt: TupleFormat =
         serde_json::from_str(content).map_err(|e| format!("tuple format parse error: {e}"))?;
@@ -194,6 +195,7 @@ fn parse_tuple_format(content: &str) -> Result<Structure, String> {
     Ok(Structure { blocks, materials })
 }
 
+#[tracing::instrument(skip_all)]
 fn parse_grid_format(content: &str) -> Result<Structure, String> {
     let fmt: GridFormat =
         serde_json::from_str(content).map_err(|e| format!("grid format parse error: {e}"))?;
@@ -226,12 +228,15 @@ fn parse_grid_format(content: &str) -> Result<Structure, String> {
     Ok(Structure { blocks, materials })
 }
 
+#[tracing::instrument(skip_all)]
 fn parse_llm_response(content: &str) -> Result<Structure, String> {
     let v: Value = serde_json::from_str(content).map_err(|e| format!("invalid JSON: {e}"))?;
 
     if v.get("l").is_some() {
+        tracing::debug!(format = "grid", "detected LLM response format");
         parse_grid_format(content)
     } else if v.get("b").is_some() {
+        tracing::debug!(format = "tuple", "detected LLM response format");
         parse_tuple_format(content)
     } else {
         Err(
@@ -245,6 +250,7 @@ fn parse_llm_response(content: &str) -> Result<Structure, String> {
 // HTTP helper
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(skip_all, fields(url = %url, model = %model))]
 async fn call_api_once(
     client: &reqwest::Client,
     url: &str,
@@ -262,7 +268,7 @@ async fn call_api_once(
         stream: true,
     };
 
-    eprintln!("[llm] sending POST {url}");
+    tracing::info!(url = %url, "sending LLM API request");
     let response = client
         .post(url)
         .bearer_auth(api_key)
@@ -270,20 +276,16 @@ async fn call_api_once(
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;
-    eprintln!("[llm] received HTTP {}", response.status());
+    tracing::info!(status = %response.status(), "received HTTP response");
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        eprintln!(
-            "[llm] request failed status={} body_preview={}",
-            status,
-            content_preview(&body, 200)
-        );
+        tracing::error!(status = %status, body_preview = %content_preview(&body, 200), "LLM API request failed");
         return Err(format!("HTTP {status}: {body}"));
     }
 
-    eprintln!("[llm] reading streaming API response body");
+    tracing::debug!("reading streaming API response");
     let mut response = response;
     let mut pending = Vec::<u8>::new();
     let mut content = String::new();
@@ -308,6 +310,7 @@ async fn call_api_once(
                         return Err(format!("stream error: {message}"));
                     }
                     StreamEvent::Done => {
+                        tracing::debug!("stream DONE marker received");
                         done = true;
                         break;
                     }
@@ -321,11 +324,10 @@ async fn call_api_once(
         }
 
         if Instant::now() >= next_progress_log {
-            eprintln!(
-                "[llm] stream progress elapsed_ms={} content_chars={} preview={}",
-                started_at.elapsed().as_millis(),
-                content.len(),
-                content_preview(&content, 120)
+            tracing::debug!(
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                content_chars = content.len(),
+                "stream progress"
             );
             next_progress_log += Duration::from_secs(10);
         }
@@ -336,14 +338,11 @@ async fn call_api_once(
     }
 
     if !done {
+        tracing::warn!("stream ended without DONE marker");
         return Err("stream ended before [DONE] marker".to_owned());
     }
 
-    eprintln!(
-        "[llm] received content chars={} preview={}",
-        content.len(),
-        content_preview(&content, 200)
-    );
+    tracing::info!(content_len = content.len(), preview = %content_preview(&content, 200), "stream complete");
 
     Ok(content)
 }
@@ -381,15 +380,12 @@ Example (3x1x2 dirt floor centered at origin):\n\
 // Public API
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(skip_all, fields(description = %description))]
 pub async fn call_llm(
     description: &str,
     inventory: &HashMap<String, u32>,
 ) -> Result<Structure, String> {
-    eprintln!(
-        "[llm] preparing request description_len={} inventory={}",
-        description.len(),
-        inventory_summary(inventory)
-    );
+    tracing::info!(description_len = description.len(), inventory = %inventory_summary(inventory), "preparing LLM request");
 
     let base_url = std::env::var("OPENROUTER_BASE_URL")
         .map_err(|_| "OPENROUTER_BASE_URL not set".to_owned())?;
@@ -397,11 +393,7 @@ pub async fn call_llm(
         std::env::var("OPENROUTER_API_KEY").map_err(|_| "OPENROUTER_API_KEY not set".to_owned())?;
     let model =
         std::env::var("OPENROUTER_MODEL").map_err(|_| "OPENROUTER_MODEL not set".to_owned())?;
-    eprintln!(
-        "[llm] config loaded base_url={} model={}",
-        base_url.trim_end_matches('/'),
-        model
-    );
+    tracing::debug!(base_url = %base_url.trim_end_matches('/'), model = %model, "LLM config loaded");
 
     let inventory_str = if inventory.is_empty() {
         "  (empty)".to_owned()
@@ -440,18 +432,11 @@ pub async fn call_llm(
 
     match parse_llm_response(&content) {
         Ok(structure) => {
-            eprintln!(
-                "[llm] parsed structure blocks={} materials={}",
-                structure.blocks.len(),
-                structure.materials.len()
-            );
+            tracing::info!(block_count = structure.blocks.len(), material_count = structure.materials.len(), "parsed LLM structure");
             Ok(structure)
         }
         Err(parse_err) => {
-            eprintln!(
-                "[llm] first parse failed: {}; retrying with error context",
-                parse_err
-            );
+            tracing::warn!(error = %parse_err, "first LLM parse failed, retrying");
             let repair_messages = vec![
                 ChatMessage {
                     role: "system",
@@ -475,6 +460,7 @@ pub async fn call_llm(
                     ),
                 },
             ];
+            tracing::info!("sending repair request to LLM");
             let content2 = call_api_once(&client, &url, &api_key, &model, repair_messages).await?;
             let structure = parse_llm_response(&content2).map_err(|e2| {
                 format!(
@@ -482,11 +468,7 @@ pub async fn call_llm(
                     content_preview(&content2, 200)
                 )
             })?;
-            eprintln!(
-                "[llm] retry succeeded blocks={} materials={}",
-                structure.blocks.len(),
-                structure.materials.len()
-            );
+            tracing::info!(block_count = structure.blocks.len(), material_count = structure.materials.len(), "LLM retry parse succeeded");
             Ok(structure)
         }
     }

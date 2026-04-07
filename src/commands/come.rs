@@ -27,10 +27,12 @@ pub fn register(commands: &mut Dispatcher) {
             });
 
         if let Some(entity) = entity {
+            tracing::info!(sender = %sender_name, "following player");
             *source.state.mode.lock() = BotMode::Following(entity);
             source.reply("On my way!");
             1
         } else {
+            tracing::warn!(sender = %sender_name, "player not found for come command");
             source.reply("I can't see you!");
             0
         }
