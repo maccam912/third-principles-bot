@@ -487,6 +487,12 @@ pub fn needs_navigation_for_placement(
     bot_block_pos == target || distance_to_stance > 1.5
 }
 
+/// Returns `true` if health decreased (indicating damage taken).
+/// Returns `false` if health is the same, increased, or previous was 0 (respawn).
+fn detected_health_drop(previous: f32, current: f32) -> bool {
+    previous > 0.0 && current < previous
+}
+
 fn placement_interaction_point(support: BlockPos, target: BlockPos) -> Vec3 {
     let support_center = support.center();
     let target_center = target.center();
@@ -1335,9 +1341,15 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                             "bot is standing at target block, navigating to stance"
                         );
                     }
-                    if !bot.is_calculating_path() {
+                    // Use a tight radius (0.5) when the bot is on the target block
+                    // to guarantee BlockPos actually changes.  A radius of 1.0 can
+                    // be satisfied without leaving the target block when the stance
+                    // is only 1 block away.  Also guard with is_executing_path() to
+                    // avoid restarting pathfinding every tick.
+                    let nav_radius = if bot_block == target { 0.5 } else { 1.0 };
+                    if !bot.is_calculating_path() && !bot.is_executing_path() {
                         bot.start_goto_with_opts(
-                            RadiusGoal::new(stance.center(), 1.0),
+                            RadiusGoal::new(stance.center(), nav_radius),
                             collect_pathfinder_opts(),
                         );
                     }
@@ -2006,5 +2018,23 @@ mod tests {
         let slots = vec![None; 46];
         let plan = super::plan_combat_weapon_equip(&slots, 36..=44, 0);
         assert_eq!(plan, None);
+    }
+
+    #[test]
+    fn health_drop_detected_when_health_decreases() {
+        assert!(super::detected_health_drop(20.0, 17.0));
+        assert!(super::detected_health_drop(10.0, 9.5));
+    }
+
+    #[test]
+    fn health_drop_not_detected_for_heal_or_same() {
+        assert!(!super::detected_health_drop(17.0, 20.0)); // healed
+        assert!(!super::detected_health_drop(20.0, 20.0)); // same
+    }
+
+    #[test]
+    fn health_drop_not_detected_for_zero_previous() {
+        // After respawn, previous health might be 0. Don't trigger combat.
+        assert!(!super::detected_health_drop(0.0, 20.0));
     }
 }
