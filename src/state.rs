@@ -588,6 +588,93 @@ where
         })
 }
 
+/// Like [`choose_safe_action_stance`] but prefers positions 2 blocks from the
+/// target so the bot's bounding box never overlaps the placement site.
+///
+/// Minecraft rejects block placement when any entity overlaps the target, so
+/// standing directly adjacent (1 block) makes it easy for the bot to drift onto
+/// the target.  Standing 2 blocks away eliminates this entirely while still
+/// being well within the 4.5-block interaction reach.
+///
+/// Falls back to adjacent (distance-1) positions if no distance-2 candidate is
+/// safe.
+pub fn choose_safe_placement_stance<F>(
+    target: BlockPos,
+    anchor: BlockPos,
+    y_offsets: &[i32],
+    is_passable: F,
+) -> Option<BlockPos>
+where
+    F: Fn(BlockPos) -> bool,
+{
+    // Distance-2 ring: all 16 positions at Chebyshev distance exactly 2.
+    const RING_2: [(i32, i32); 16] = [
+        // Axis-aligned
+        (2, 0),
+        (-2, 0),
+        (0, 2),
+        (0, -2),
+        // Off-axis
+        (2, 1),
+        (2, -1),
+        (-2, 1),
+        (-2, -1),
+        (1, 2),
+        (1, -2),
+        (-1, 2),
+        (-1, -2),
+        // Corners
+        (2, 2),
+        (-2, 2),
+        (2, -2),
+        (-2, -2),
+    ];
+    // Distance-1 fallback (cardinal directions).
+    const RING_1: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+
+    let min_safe_y = anchor.y - 1;
+
+    // Try distance-2 first.
+    let result = y_offsets
+        .iter()
+        .flat_map(|y_offset| {
+            RING_2.iter().map(move |(dx, dz)| {
+                BlockPos::new(target.x + dx, target.y + y_offset, target.z + dz)
+            })
+        })
+        .filter(|c| c.y >= min_safe_y)
+        .filter(|c| can_occupy_block(*c, &is_passable))
+        .filter(|c| has_escape_step(*c, target, &is_passable))
+        .min_by_key(|c| {
+            (
+                block_distance_sq(*c, anchor),
+                block_distance_sq(*c, target),
+            )
+        });
+
+    if result.is_some() {
+        return result;
+    }
+
+    // Fall back to adjacent positions.
+    y_offsets
+        .iter()
+        .flat_map(|y_offset| {
+            RING_1.iter().map(move |(dx, dz)| {
+                BlockPos::new(target.x + dx, target.y + y_offset, target.z + dz)
+            })
+        })
+        .filter(|c| c.y >= min_safe_y)
+        .filter(|c| can_occupy_block(*c, &is_passable))
+        .filter(|c| has_escape_step(*c, target, &is_passable))
+        .min_by_key(|c| {
+            (
+                block_distance_sq(*c, anchor),
+                block_distance_sq(*c, target),
+            )
+        })
+}
+
 pub fn choose_safe_collect_target<F>(
     candidates: &[BlockPos],
     bot_pos: BlockPos,
@@ -668,14 +755,31 @@ where
 /// Navigation is needed when:
 /// - The bot is too far from the chosen stance position (`distance_to_stance > 1.5`), OR
 /// - The bot's block position is the same as the target — the Minecraft server
-///   rejects placement when an entity's bounding box overlaps the target.
+///   rejects placement when an entity's bounding box overlaps the target, OR
+/// - The bot is directly adjacent to the target (manhattan distance 1) and the
+///   stance is further away — the bot can easily drift onto the target from an
+///   adjacent position, so we navigate to the proper stance instead.
 pub fn needs_navigation_for_placement(
     bot_block_pos: BlockPos,
     target: BlockPos,
-    _stance: BlockPos,
+    stance: BlockPos,
     distance_to_stance: f64,
 ) -> bool {
-    bot_block_pos == target || distance_to_stance > 1.5
+    if bot_block_pos == target {
+        return true;
+    }
+    if distance_to_stance > 1.5 {
+        return true;
+    }
+    // If bot is adjacent to target but not at the preferred stance, navigate.
+    // This prevents the bot from drifting onto the target during placement.
+    let manhattan =
+        (bot_block_pos.x - target.x).abs() + (bot_block_pos.z - target.z).abs();
+    let y_diff = (bot_block_pos.y - target.y).abs();
+    if manhattan <= 1 && y_diff <= 1 && bot_block_pos != stance {
+        return true;
+    }
+    false
 }
 
 /// Returns `true` if health decreased (indicating damage taken).
@@ -1096,6 +1200,22 @@ fn choose_world_safe_action_stance(
     let world = world.read();
 
     choose_safe_action_stance(target, anchor, y_offsets, |pos| {
+        is_passable_block(world.get_block_state(pos).map(BlockKind::from))
+    })
+}
+
+/// Placement-specific stance: prefers distance-2 positions to avoid entity
+/// overlap with the target block.
+fn choose_world_safe_placement_stance(
+    bot: &Client,
+    target: BlockPos,
+    anchor: BlockPos,
+    y_offsets: &[i32],
+) -> Option<BlockPos> {
+    let world = bot.world();
+    let world = world.read();
+
+    choose_safe_placement_stance(target, anchor, y_offsets, |pos| {
         is_passable_block(world.get_block_state(pos).map(BlockKind::from))
     })
 }
@@ -1576,7 +1696,7 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                 }
 
                 let Some(stance) =
-                    choose_world_safe_action_stance(&bot, target, job.origin, &[0, -1])
+                    choose_world_safe_placement_stance(&bot, target, job.origin, &[0, -1])
                 else {
                     tracing::error!(block = %block_entry.block, x = target.x, y = target.y, z = target.z, "no safe placement stance");
                     bot.stop_pathfinding();
@@ -1805,10 +1925,11 @@ mod tests {
         BotMode, CollectJob, CollectPhase, CollectProgress, CollectTarget, CombatJob, CombatPhase,
         PreferredTool, ToolEquipPlan, ToolSearchOutcome, choose_next_collect_block,
         choose_placement_support_block, choose_safe_action_stance, choose_safe_collect_target,
-        collect_progress_from_counts, compute_missing, log_collect_tool_search_attempt,
-        log_collect_tool_search_outcome, needs_navigation_for_placement,
-        next_collect_phase_after_search, normalize_collect_candidates, plan_tool_equip,
-        preferred_tool_for_collect_target, sort_blocks_by_y, strip_namespace,
+        choose_safe_placement_stance, collect_progress_from_counts, compute_missing,
+        log_collect_tool_search_attempt, log_collect_tool_search_outcome,
+        needs_navigation_for_placement, next_collect_phase_after_search,
+        normalize_collect_candidates, plan_tool_equip, preferred_tool_for_collect_target,
+        sort_blocks_by_y, strip_namespace,
     };
     use std::collections::HashSet;
 
@@ -2266,6 +2387,42 @@ mod tests {
         assert!(
             !needs_navigation_for_placement(bot_block, target, stance, 0.3),
             "should NOT require navigation when bot is at stance and not at target"
+        );
+    }
+
+    #[test]
+    fn placement_needs_navigation_when_adjacent_to_target_but_not_at_stance() {
+        let target = azalea::BlockPos::new(0, 64, 0);
+        let stance = azalea::BlockPos::new(2, 64, 0); // distance-2 stance
+        // Bot is adjacent to target (manhattan 1) but not at the preferred stance
+        let bot_block = azalea::BlockPos::new(1, 64, 0);
+        assert!(
+            needs_navigation_for_placement(bot_block, target, stance, 1.0),
+            "should require navigation when bot is adjacent to target but not at stance"
+        );
+    }
+
+    #[test]
+    fn placement_stance_prefers_distance_2_over_adjacent() {
+        let target = azalea::BlockPos::new(0, 64, 0);
+        let anchor = azalea::BlockPos::new(0, 64, 0);
+        // All positions on a flat plane are valid (ground below, air above)
+        let solids: HashSet<azalea::BlockPos> = (-5..=5)
+            .flat_map(|x| (-5..=5).map(move |z| azalea::BlockPos::new(x, 63, z)))
+            .collect();
+
+        let stance =
+            choose_safe_placement_stance(target, anchor, &[0], |pos| !solids.contains(&pos));
+        let stance = stance.expect("should find a placement stance");
+        // Stance should be at distance 2 from target, not distance 1
+        let dx = (stance.x - target.x).abs();
+        let dz = (stance.z - target.z).abs();
+        let chebyshev = dx.max(dz);
+        assert!(
+            chebyshev >= 2,
+            "placement stance should prefer distance-2 (got {:?}, Chebyshev distance {})",
+            stance,
+            chebyshev
         );
     }
 
