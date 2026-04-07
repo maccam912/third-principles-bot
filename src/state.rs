@@ -1763,15 +1763,15 @@ fn build_tick(bot: Client, state: State, mut job: BuildJob) {
                             "bot is standing at target block, navigating to stance"
                         );
                     }
-                    // Use a tight radius (0.5) when the bot is on the target block
-                    // to guarantee BlockPos actually changes.  A radius of 1.0 can
-                    // be satisfied without leaving the target block when the stance
-                    // is only 1 block away.  Also guard with is_executing_path() to
-                    // avoid restarting pathfinding every tick.
-                    let nav_radius = if bot_block == target { 0.5 } else { 1.0 };
+                    // Always use a tight radius (0.5) to ensure the bot's
+                    // block-position lands inside the stance block.  A radius of
+                    // 1.0 can be satisfied while the bot is in an adjacent block
+                    // (e.g. z=-132.53 → block z=-133 instead of z=-132), causing
+                    // an infinite navigation loop since we require exact block
+                    // match.
                     if !bot.is_calculating_path() && !bot.is_executing_path() {
                         bot.start_goto_with_opts(
-                            RadiusGoal::new(stance.center(), nav_radius),
+                            RadiusGoal::new(stance.center(), 0.5),
                             collect_pathfinder_opts(),
                         );
                     }
