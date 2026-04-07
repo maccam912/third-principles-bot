@@ -43,6 +43,8 @@ pub enum BotMode {
     /// Collecting resources until the requested inventory delta is reached.
     Collecting(CollectJob),
     Building(BuildJob),
+    /// Defending against hostile mobs. Stores the interrupted mode for resume.
+    Combat(CombatJob),
 }
 
 fn mode_name(mode: &BotMode) -> &'static str {
@@ -51,6 +53,7 @@ fn mode_name(mode: &BotMode) -> &'static str {
         BotMode::Following(_) => "following",
         BotMode::Collecting(_) => "collecting",
         BotMode::Building(_) => "building",
+        BotMode::Combat(_) => "combat",
     }
 }
 
@@ -228,6 +231,33 @@ pub enum BuildPhase {
         placement_attempts: u8,
         waiting_for_confirmation: bool,
     },
+}
+
+#[derive(Clone)]
+pub enum CombatPhase {
+    /// Equipping the best available weapon.
+    Equipping,
+    /// Looking for hostile mobs nearby.
+    Scanning,
+    /// Moving toward a hostile mob to get within melee range.
+    Approaching(Entity),
+    /// Actively attacking a mob (swing when cooldown allows).
+    Attacking(Entity),
+}
+
+#[derive(Clone)]
+pub struct CombatJob {
+    /// The mode that was active when combat was triggered.
+    /// Restored verbatim when combat ends.
+    pub previous_mode: Box<BotMode>,
+    /// Current combat phase.
+    pub phase: CombatPhase,
+    /// The bot's health when combat started (diagnostics).
+    pub health_at_entry: f32,
+    /// Tick count when combat started. Used for 30-second timeout (600 ticks).
+    /// Note: `bot.ticks_connected()` may return u32 or another integer type.
+    /// Use the same type as the return value, or cast with `as u32`.
+    pub started_at_tick: u32,
 }
 
 pub fn strip_namespace(id: &str) -> &str {
@@ -1328,6 +1358,7 @@ pub struct State {
     /// Shared reference to the Brigadier dispatcher (built once, shared across
     /// clones of State for the same bot).
     pub dispatcher: Arc<commands::Dispatcher>,
+    pub last_known_health: Arc<Mutex<f32>>,
 }
 
 impl Default for State {
@@ -1335,6 +1366,7 @@ impl Default for State {
         Self {
             mode: Arc::new(Mutex::new(BotMode::Idle)),
             dispatcher: Arc::new(commands::build()),
+            last_known_health: Arc::new(Mutex::new(20.0)),
         }
     }
 }
@@ -1429,6 +1461,7 @@ fn tick(bot: Client, state: State) {
         }
         BotMode::Collecting(job) => collect_tick(bot, state, job),
         BotMode::Building(job) => build_tick(bot, state, job),
+        BotMode::Combat(_) => { /* combat tick logic added in a later task */ }
     }
 }
 

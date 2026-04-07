@@ -129,6 +129,7 @@ fn mode_display_name(mode: &BotMode) -> String {
             };
             format!("Building({phase_name})")
         }
+        BotMode::Combat(_) => "Combat".to_owned(),
     }
 }
 
