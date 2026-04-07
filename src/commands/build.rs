@@ -5,11 +5,11 @@ use std::sync::Arc;
 use azalea::brigadier::prelude::*;
 use azalea::pathfinder::PathfinderClientExt;
 use azalea::registry::builtin::BlockKind;
-use azalea::{block::BlockStates, BlockPos};
+use azalea::{BlockPos, block::BlockStates};
 use parking_lot::Mutex;
 
 use crate::commands::{Ctx, Dispatcher};
-use crate::state::{block_distance_sq, BotMode, BuildJob, BuildPhase};
+use crate::state::{BotMode, BuildJob, BuildPhase, block_distance_sq};
 
 pub fn register(commands: &mut Dispatcher) {
     commands.register(

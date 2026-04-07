@@ -432,7 +432,11 @@ pub async fn call_llm(
 
     match parse_llm_response(&content) {
         Ok(structure) => {
-            tracing::info!(block_count = structure.blocks.len(), material_count = structure.materials.len(), "parsed LLM structure");
+            tracing::info!(
+                block_count = structure.blocks.len(),
+                material_count = structure.materials.len(),
+                "parsed LLM structure"
+            );
             Ok(structure)
         }
         Err(parse_err) => {
@@ -468,7 +472,11 @@ pub async fn call_llm(
                     content_preview(&content2, 200)
                 )
             })?;
-            tracing::info!(block_count = structure.blocks.len(), material_count = structure.materials.len(), "LLM retry parse succeeded");
+            tracing::info!(
+                block_count = structure.blocks.len(),
+                material_count = structure.materials.len(),
+                "LLM retry parse succeeded"
+            );
             Ok(structure)
         }
     }

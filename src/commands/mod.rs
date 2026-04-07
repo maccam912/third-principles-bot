@@ -5,7 +5,7 @@ mod collect;
 mod come;
 mod stop;
 
-use azalea::{brigadier::prelude::CommandDispatcher, Client};
+use azalea::{Client, brigadier::prelude::CommandDispatcher};
 use parking_lot::Mutex;
 
 use crate::state::State;

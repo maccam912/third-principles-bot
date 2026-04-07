@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use azalea::ecs as bevy_ecs;
 use azalea::prelude::*;
 use parking_lot::Mutex;
 use third_principles_bot::commands::queue_build;
 use third_principles_bot::state::{BotMode, BuildPhase, State};
-use azalea::ecs as bevy_ecs;
 
 #[derive(Clone)]
 struct LiveSmokeConfig {
@@ -30,8 +30,8 @@ impl LiveSmokeConfig {
 
         let bot_name =
             std::env::var("LIVE_TEST_BOT_NAME").unwrap_or_else(|_| "GoodBotSmoke".to_owned());
-        let description = std::env::var("LIVE_TEST_BUILD_DESCRIPTION")
-            .unwrap_or_else(|_| "wood hut".to_owned());
+        let description =
+            std::env::var("LIVE_TEST_BUILD_DESCRIPTION").unwrap_or_else(|_| "wood hut".to_owned());
         let start_delay_ticks = std::env::var("LIVE_TEST_START_DELAY_TICKS")
             .ok()
             .and_then(|value| value.parse().ok())

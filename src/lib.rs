@@ -26,8 +26,8 @@ pub fn init_tracing(tag: &str) -> WorkerGuard {
     // Use a simple epoch-seconds timestamp to avoid pulling in chrono.
     let filename = format!("{now}_{tag}.ndjson");
 
-    let file = std::fs::File::create(format!("traces/{filename}"))
-        .expect("failed to create trace file");
+    let file =
+        std::fs::File::create(format!("traces/{filename}")).expect("failed to create trace file");
     let (non_blocking, guard) = tracing_appender::non_blocking(file);
 
     // Default filter: full debug for our crate, warn for everything else.
